@@ -6,6 +6,8 @@ Built for laptops with soldered memory and no upgrade path. If you have an RTX c
 
 Tested on: RTX 3070 Laptop (GA104M, 16 GB physical, 8 GB VRAM), driver 580.159.03, kernel 6.17, Pop!_OS. Allocated 7 GB for swap. End result including zram and SSD swap ~46 GB, tripled the addressable memory. Overflow order is: RAM fills, then VRAM absorbs spill (fast, PCIe), then zram compresses the rest (CPU), then SSD only if everything else is exhausted.
 
+![demo](demo.gif)
+
 ---
 
 ## How it works
