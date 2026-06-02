@@ -76,6 +76,14 @@ After changing, run `sudo systemctl daemon-reload && sudo systemctl restart vram
 
 ---
 
+## Power management
+
+The installer asks whether to enable power-aware management on first install. If enabled, the service automatically stops when you unplug from AC (or when battery drops below a threshold), and restarts when power is restored. Manual `systemctl stop` is always respected and won't be overridden.
+
+To change settings after install, edit `/etc/nbd-vram.conf`. Changes take effect on the next poll (within 60 seconds) or immediately on the next AC plug/unplug event.
+
+---
+
 ## Smoke test (without installing)
 
 ```sh
@@ -108,12 +116,7 @@ For laptops already using zram, set VRAM swap at a higher priority so it absorbs
 ## Uninstall
 
 ```sh
-sudo systemctl disable --now vram-swap-nbd
-sudo rm /usr/local/bin/nbd-vram
-sudo rm /usr/local/bin/nbd-vram-connect.sh
-sudo rm /usr/local/bin/nbd-vram-disconnect.sh
-sudo rm /etc/systemd/system/vram-swap-nbd.service
-sudo systemctl daemon-reload
+sudo bash uninstall.sh
 ```
 
 ---
