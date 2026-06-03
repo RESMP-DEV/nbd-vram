@@ -2,9 +2,9 @@
 
 Use your NVIDIA GPU's VRAM as swap space on Linux.
 
-Built for laptops with soldered memory and no upgrade path. If you have an RTX card sitting there with 8GB of VRAM and you're getting swapped to SSD, this puts that VRAM to work.
+Built for hybrid graphics laptops with soldered memory and no upgrade path. The display runs off the integrated AMD/Intel GPU. The NVIDIA card sits idle most of the time, its VRAM completely unused. This puts that VRAM to work as high-priority swap.
 
-Tested on: RTX 3070 Laptop (GA104M, 16 GB physical, 8 GB VRAM), driver 580.159.03, kernel 6.17, Pop!_OS. Allocated 7 GB for swap. End result including zram and SSD swap ~46 GB, tripled the addressable memory. Overflow order is: RAM fills, then VRAM absorbs spill (fast, PCIe), then zram compresses the rest (CPU), then SSD only if everything else is exhausted.
+Tested on: AMD/ATI + RTX 3070 Laptop (GA104M, 16 GB RAM, 8 GB VRAM), driver 580.159.03, kernel 6.17, Pop!_OS. Allocated 7 GB for swap. End result including zram and SSD swap: ~46 GB total addressable memory, tripled from stock. Overflow order: RAM fills, then VRAM absorbs the spill (PCIe), then zram compresses the rest (CPU), then SSD only if everything else is exhausted.
 
 ![demo](demo.gif)
 
@@ -104,12 +104,60 @@ Writes the entire VRAM partition with zeros, verifies a sample read back, then a
 
 ## Performance
 
-Measured on RTX 3070 Laptop via `test-fill.sh` (7 GiB sequential write, 4M blocks):
+Tested on RTX 3070 Laptop (8 GB VRAM), kernel 6.17, Pop!_OS. Compared against NVMe cryptswap (dm-crypt, PCIe 4.0). All benchmarks run with O_DIRECT to bypass page cache.
 
-- Sequential throughput: ~1.3 GB/s
-- Latency is lower than NVMe since the path goes through PCIe to GPU rather than storage
+Three benchmarks are in `benchmarks/`. Each runs NVMe first, then starts the VRAM service and runs the same test against the block device. State is restored on exit.
 
-For laptops already using zram, set VRAM swap at a higher priority so it absorbs overflow before hitting SSD.
+```sh
+sudo bash benchmarks/bench-throughput.sh   # sequential read/write (dd, 2 GiB, O_DIRECT)
+sudo bash benchmarks/bench-iops.sh         # 4K random IOPS (fio, libaio, iodepth=32)
+sudo bash benchmarks/bench-latency.sh      # per-operation latency (ioping, 20 requests)
+```
+
+`fio` and `ioping` are installed automatically if missing.
+
+---
+
+### Sequential throughput (dd, 2 GiB)
+
+![bench-throughput](benchmarks/bench-throughput.gif)
+
+| Device | Write | Read |
+|--------|-------|------|
+| NVMe | 2.7 GB/s | 2.9 GB/s |
+| VRAM (nbd) | 1.1 GB/s | 2.3 GB/s |
+
+VRAM is slower for large sequential transfers. The bottleneck is the NBD + CUDA userspace round-trip - every block crosses a Unix socket and a `cuMemcpy` call, which adds overhead that NVMe's direct kernel block path doesn't pay. Sequential throughput is not the primary swap workload (the kernel swaps individual 4K pages, not 4 MiB streams) - see the IOPS and latency benchmarks below.
+
+---
+
+### 4K random IOPS (fio, libaio, iodepth=32)
+
+![bench-iops](benchmarks/bench-iops.gif)
+
+| Device | Read IOPS | Write IOPS | Avg latency |
+|--------|-----------|------------|-------------|
+| NVMe | 45.4k | 45.3k | 343 us |
+| VRAM (nbd) | 28.7k | 28.7k | 550 us |
+
+NVMe wins for sustained random I/O. At iodepth=32, NVMe can have 32 requests genuinely in flight simultaneously; the NBD+CUDA path serialises them through the daemon, so the depth advantage is reduced. The VRAM daemon also adds CPU overhead that the NVMe path does not pay. For continuous high-throughput swap pressure, NVMe is faster.
+
+The picture changes for sporadic access - see the latency benchmark below.
+
+---
+
+### Per-operation latency (ioping, 4K reads, 1 request/sec)
+
+![bench-latency](benchmarks/bench-latency.gif)
+
+| Device | Min | Avg | Max |
+|--------|-----|-----|-----|
+| NVMe | 120 us | 9.05 ms | 10.1 ms |
+| VRAM (nbd) | 134 us | 335 us | 490 us |
+
+**VRAM is 27x faster average latency.** The NVMe drive is physically capable of ~112 us (visible on the warmup request) but APST (Autonomous Power State Transitions) puts it to sleep between requests. At 1 request per second - the rate of sporadic swap access - it wakes cold almost every time and pays a ~9 ms penalty. VRAM has no power states and responds in 133-490 us consistently.
+
+This is the scenario that matters most in practice. Memory pressure on a laptop is rarely a sustained GB/s flood - it is individual 4K page faults arriving seconds apart. Every one of those faults stalls waiting for the swap device to respond. At 9 ms per fault, NVMe swap is felt. At 335 us, VRAM swap is not.
 
 ---
 
