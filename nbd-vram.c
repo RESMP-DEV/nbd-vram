@@ -20,6 +20,7 @@
 #include <arpa/inet.h>
 #include <endian.h>
 #include <dlfcn.h>
+#include <sys/mman.h>
 
 /* -------------------------------------------------------------------------
  * CUDA driver API (dynamic load)
@@ -450,6 +451,13 @@ int main(void)
     signal(SIGTERM, sig_handler);
     signal(SIGINT,  sig_handler);
     signal(SIGPIPE, SIG_IGN);
+
+    /* Prevent kernel from paging out our own pages - doing so would route
+     * the page fault back through this daemon, deadlocking under swap pressure.
+     * Requires LimitMEMLOCK=infinity in the systemd service. */
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
+        fprintf(stderr, "[nbd-vram] mlockall failed (%s) — daemon pages may be swapped, risking deadlock\n",
+                strerror(errno));
 
     if (load_libcuda() != 0) goto out;
 

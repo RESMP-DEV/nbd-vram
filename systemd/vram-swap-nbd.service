@@ -19,6 +19,8 @@ ExecStart=/usr/local/bin/nbd-vram
 ExecStartPost=/usr/local/bin/nbd-vram-connect.sh
 ExecStop=/usr/local/bin/nbd-vram-disconnect.sh
 
+LimitMEMLOCK=infinity
+
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=60
