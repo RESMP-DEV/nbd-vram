@@ -102,6 +102,24 @@ Writes the entire VRAM partition with zeros, verifies a sample read back, then a
 
 ---
 
+## Memory safety
+
+The daemon runs as a swap device, which creates a subtle risk: if the kernel tries to page out the daemon's own memory under swap pressure, it routes that page fault back through the same daemon. The daemon is single-threaded and already mid-request, so it deadlocks. The result is a full system hang.
+
+To prevent this, the daemon calls `mlockall(MCL_CURRENT | MCL_FUTURE)` on startup, which pins all current and future pages into RAM so the kernel can never evict them. The systemd service sets `LimitMEMLOCK=infinity` to allow it.
+
+You can verify it is working after the service starts:
+
+```sh
+grep -E 'VmLck|VmSwap' /proc/$(pgrep nbd-vram)/status
+# VmLck:  12116160 kB   <- non-zero, daemon pages are locked
+# VmSwap:        0 kB   <- kernel has not paged any daemon memory out
+```
+
+`VmLck` will appear much larger than `VmRSS` - that is normal. `mlockall` locks the entire address space including the CUDA device memory mappings, which live in VRAM rather than RAM.
+
+---
+
 ## Performance
 
 Tested on RTX 3070 Laptop (8 GB VRAM), kernel 6.17, Pop!_OS. Compared against NVMe cryptswap (dm-crypt, PCIe 4.0). All benchmarks run with O_DIRECT to bypass page cache.
