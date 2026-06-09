@@ -22,7 +22,7 @@ NVME_DIR=$(find_nvme_dir)
 NVME_FILE="$NVME_DIR/.nbd-vram-bench-tmp"
 NVME_PART=$(df "$NVME_DIR" --output=source | tail -1)
 
-# Simulated typing with realistic delay (matches demo.sh)
+# Simulated typing with realistic delay
 type_cmd() {
     echo -n "$ "
     printf '%s' "$1" | pv -qL 40
@@ -63,7 +63,7 @@ trap cleanup EXIT
 clear
 sleep 1
 
-echo "# VRAM swap vs NVMe — ${BENCH_GiB} GiB sequential benchmark (O_DIRECT)"
+echo "# NBD-VRAM vs NVMe - ${BENCH_GiB} GiB sequential benchmark (O_DIRECT)"
 sleep 1
 
 # ── 1/2  NVMe (no service needed) ───────────────────────────────
@@ -125,8 +125,15 @@ sleep 1.5
 echo ""
 echo "# ── results ──────────────────────────────────"
 sleep 0.5
-printf "  %-14s  write: %-12s  read: %s\n" "NVMe ($NVME_PART)" "$NVME_WRITE" "$NVME_READ"
-printf "  %-14s  write: %-12s  read: %s\n" "VRAM ($VRAM_DEV)" "$VRAM_WRITE" "$VRAM_READ"
+# highlight the higher-bandwidth device
+GREEN=$'\033[1;32m'; RESET=$'\033[0m'; NV=""; VR=""
+bw_mbps() { awk -v s="$1" 'BEGIN{n=s+0; if(s ~ /GB\/s/) n*=1000; print n}'; }
+if awk "BEGIN{exit !( $(bw_mbps "$NVME_WRITE")+$(bw_mbps "$NVME_READ") >= $(bw_mbps "$VRAM_WRITE")+$(bw_mbps "$VRAM_READ") )}"; then NV=$GREEN; else VR=$GREEN; fi
+printf "  ${NV}%-14s  write: %-12s  read: %s${RESET}\n" "NVMe ($NVME_PART)" "$NVME_WRITE" "$NVME_READ"
+printf "  ${VR}%-14s  write: %-12s  read: %s${RESET}\n" "NBD-VRAM ($VRAM_DEV)" "$VRAM_WRITE" "$VRAM_READ"
+# Optional machine-readable result line (set BENCH_RESULT_FILE to capture): nvme_w nvme_r vram_w vram_r
+[ -n "${BENCH_RESULT_FILE:-}" ] && printf '%s\t%s\t%s\t%s\n' \
+    "$(bw_mbps "$NVME_WRITE")" "$(bw_mbps "$NVME_READ")" "$(bw_mbps "$VRAM_WRITE")" "$(bw_mbps "$VRAM_READ")" >> "$BENCH_RESULT_FILE"
 sleep 1.5
 
 echo ""
