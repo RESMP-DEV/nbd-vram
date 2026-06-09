@@ -1,9 +1,9 @@
 /* nbd-vram.c - NBD server backed by GPU VRAM via CUDA
  *
  * Implements NBD fixed-newstyle protocol over a Unix socket.
- * No NVIDIA P2P or kernel symbols needed - uses cuMemcpyHtoDAsync/DtoHAsync.
+ * No NVIDIA P2P or kernel symbols needed - uses cuMemcpyHtoD/DtoH.
  *
- * Compile: gcc -O2 -o nbd-vram nbd-vram.c -ldl -lpthread
+ * Compile: gcc -O2 -o nbd-vram nbd-vram.c -ldl
  */
 
 #include <stdio.h>
@@ -21,60 +21,41 @@
 #include <endian.h>
 #include <dlfcn.h>
 #include <sys/mman.h>
-#include <sys/prctl.h>
-#include <pthread.h>
-
-/* PR_SET_IO_FLUSHER (Linux 5.6+) may be absent from older headers */
-#ifndef PR_SET_IO_FLUSHER
-#define PR_SET_IO_FLUSHER 57
-#endif
 
 /* -------------------------------------------------------------------------
  * CUDA driver API (dynamic load)
  * ---------------------------------------------------------------------- */
 
-typedef int                CUresult;
-typedef int                CUdevice;
+typedef int             CUresult;
+typedef int             CUdevice;
 typedef unsigned long long CUdeviceptr;
-typedef struct CUctx_st    *CUcontext;
-typedef struct CUstream_st *CUstream;
+typedef struct CUctx_st  *CUcontext;
 
-#define CUDA_SUCCESS           0
-#define CU_CTX_SCHED_AUTO      0
-#define CU_STREAM_NON_BLOCKING 1
+#define CUDA_SUCCESS    0
+#define CU_CTX_SCHED_AUTO 0
 
 typedef CUresult (*pfn_cuInit)(unsigned int);
 typedef CUresult (*pfn_cuDeviceGet)(CUdevice *, int);
 typedef CUresult (*pfn_cuCtxCreate)(CUcontext *, unsigned int, CUdevice);
 typedef CUresult (*pfn_cuCtxDestroy)(CUcontext);
-typedef CUresult (*pfn_cuCtxSetCurrent)(CUcontext);
 typedef CUresult (*pfn_cuMemAlloc)(CUdeviceptr *, size_t);
 typedef CUresult (*pfn_cuMemFree)(CUdeviceptr);
-typedef CUresult (*pfn_cuMemcpyHtoDAsync)(CUdeviceptr, const void *, size_t, CUstream);
-typedef CUresult (*pfn_cuMemcpyDtoHAsync)(void *, CUdeviceptr, size_t, CUstream);
-typedef CUresult (*pfn_cuStreamCreate)(CUstream *, unsigned int);
-typedef CUresult (*pfn_cuStreamDestroy)(CUstream);
-typedef CUresult (*pfn_cuStreamSynchronize)(CUstream);
-typedef CUresult (*pfn_cuMemAllocHost)(void **, size_t);
-typedef CUresult (*pfn_cuMemFreeHost)(void *);
+typedef CUresult (*pfn_cuMemcpyHtoD)(CUdeviceptr, const void *, size_t);
+typedef CUresult (*pfn_cuMemcpyDtoH)(void *, CUdeviceptr, size_t);
+typedef CUresult (*pfn_cuCtxSynchronize)(void);
 typedef CUresult (*pfn_cuGetErrorString)(CUresult, const char **);
 
-static void                  *g_libcuda;
-static pfn_cuInit              _cuInit;
-static pfn_cuDeviceGet         _cuDeviceGet;
-static pfn_cuCtxCreate         _cuCtxCreate;
-static pfn_cuCtxDestroy        _cuCtxDestroy;
-static pfn_cuCtxSetCurrent     _cuCtxSetCurrent;
-static pfn_cuMemAlloc          _cuMemAlloc;
-static pfn_cuMemFree           _cuMemFree;
-static pfn_cuMemcpyHtoDAsync   _cuMemcpyHtoDAsync;
-static pfn_cuMemcpyDtoHAsync   _cuMemcpyDtoHAsync;
-static pfn_cuStreamCreate      _cuStreamCreate;
-static pfn_cuStreamDestroy     _cuStreamDestroy;
-static pfn_cuStreamSynchronize _cuStreamSynchronize;
-static pfn_cuMemAllocHost      _cuMemAllocHost;
-static pfn_cuMemFreeHost       _cuMemFreeHost;
-static pfn_cuGetErrorString    _cuGetErrorString;
+static void             *g_libcuda;
+static pfn_cuInit        _cuInit;
+static pfn_cuDeviceGet   _cuDeviceGet;
+static pfn_cuCtxCreate   _cuCtxCreate;
+static pfn_cuCtxDestroy  _cuCtxDestroy;
+static pfn_cuMemAlloc    _cuMemAlloc;
+static pfn_cuMemFree     _cuMemFree;
+static pfn_cuMemcpyHtoD  _cuMemcpyHtoD;
+static pfn_cuMemcpyDtoH  _cuMemcpyDtoH;
+static pfn_cuCtxSynchronize _cuCtxSynchronize;
+static pfn_cuGetErrorString  _cuGetErrorString;
 
 #define LOAD_SYM(h, name, pfn) do { \
     pfn = dlsym(h, name); \
@@ -90,21 +71,16 @@ static int load_libcuda(void) {
         if (g_libcuda) { printf("[nbd-vram] loaded %s\n", paths[i]); break; }
     }
     if (!g_libcuda) { fprintf(stderr, "[nbd-vram] cannot load libcuda.so.1\n"); return -1; }
-    LOAD_SYM(g_libcuda, "cuInit",                _cuInit);
-    LOAD_SYM(g_libcuda, "cuDeviceGet",           _cuDeviceGet);
-    LOAD_SYM(g_libcuda, "cuCtxCreate_v2",        _cuCtxCreate);
-    LOAD_SYM(g_libcuda, "cuCtxDestroy_v2",       _cuCtxDestroy);
-    LOAD_SYM(g_libcuda, "cuCtxSetCurrent",       _cuCtxSetCurrent);
-    LOAD_SYM(g_libcuda, "cuMemAlloc_v2",         _cuMemAlloc);
-    LOAD_SYM(g_libcuda, "cuMemFree_v2",          _cuMemFree);
-    LOAD_SYM(g_libcuda, "cuMemcpyHtoDAsync_v2",  _cuMemcpyHtoDAsync);
-    LOAD_SYM(g_libcuda, "cuMemcpyDtoHAsync_v2",  _cuMemcpyDtoHAsync);
-    LOAD_SYM(g_libcuda, "cuStreamCreate",         _cuStreamCreate);
-    LOAD_SYM(g_libcuda, "cuStreamDestroy_v2",     _cuStreamDestroy);
-    LOAD_SYM(g_libcuda, "cuStreamSynchronize",    _cuStreamSynchronize);
-    LOAD_SYM(g_libcuda, "cuMemAllocHost_v2",      _cuMemAllocHost);
-    LOAD_SYM(g_libcuda, "cuMemFreeHost",          _cuMemFreeHost);
-    LOAD_SYM(g_libcuda, "cuGetErrorString",       _cuGetErrorString);
+    LOAD_SYM(g_libcuda, "cuInit",           _cuInit);
+    LOAD_SYM(g_libcuda, "cuDeviceGet",      _cuDeviceGet);
+    LOAD_SYM(g_libcuda, "cuCtxCreate_v2",   _cuCtxCreate);
+    LOAD_SYM(g_libcuda, "cuCtxDestroy_v2",  _cuCtxDestroy);
+    LOAD_SYM(g_libcuda, "cuMemAlloc_v2",    _cuMemAlloc);
+    LOAD_SYM(g_libcuda, "cuMemFree_v2",     _cuMemFree);
+    LOAD_SYM(g_libcuda, "cuMemcpyHtoD_v2",  _cuMemcpyHtoD);
+    LOAD_SYM(g_libcuda, "cuMemcpyDtoH_v2",  _cuMemcpyDtoH);
+    LOAD_SYM(g_libcuda, "cuCtxSynchronize", _cuCtxSynchronize);
+    LOAD_SYM(g_libcuda, "cuGetErrorString", _cuGetErrorString);
     return 0;
 }
 
@@ -157,9 +133,8 @@ static const char *cuda_err(CUresult r) {
 #define NBD_INFO_EXPORT      0
 
 /* Transmission flags (per-export) */
-#define NBD_FLAG_HAS_FLAGS      0x0001
-#define NBD_FLAG_SEND_FLUSH     0x0004
-#define NBD_FLAG_CAN_MULTI_CONN 0x0100
+#define NBD_FLAG_HAS_FLAGS   0x0001
+#define NBD_FLAG_SEND_FLUSH  0x0004
 
 /* Transmission request magic */
 #define NBD_REQUEST_MAGIC    0x25609513
@@ -287,7 +262,7 @@ static int nbd_handshake(int fd, uint64_t vram_size)
         /* Limit option payload to something sane */
         if (opt_len > 65536) return -1;
 
-        uint16_t tx_flags = NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH | NBD_FLAG_CAN_MULTI_CONN;
+        uint16_t tx_flags = NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH;
 
         switch (opt) {
         case NBD_OPT_EXPORT_NAME:
@@ -351,40 +326,24 @@ static int nbd_handshake(int fd, uint64_t vram_size)
 #define SIZE_ALIGN      (64 * 1024)
 #define SOCK_PATH       "/run/nbd-vram.sock"
 #define IO_BUF_SIZE     (4 * 1024 * 1024)
-#define NBD_THREADS_MAX     64
-#define NBD_THREADS_DEFAULT  4
 
 static CUdeviceptr  g_vram_ptr;
 static uint64_t     g_vram_size;
-static CUcontext    g_cu_ctx;
-static int          g_listen_fd  = -1;
-static volatile int g_running    = 1;
-static int          g_nbd_threads = NBD_THREADS_DEFAULT;
-static volatile int g_client_fds[NBD_THREADS_MAX];
+static int          g_listen_fd = -1;
+static volatile int g_running   = 1;
 
-static void sig_handler(int sig) {
-    (void)sig;
-    g_running = 0;
-    /* shutdown active client sockets so threads blocked in recv_all() unblock */
-    for (int i = 0; i < g_nbd_threads; i++) {
-        int fd = g_client_fds[i];
-        if (fd >= 0) shutdown(fd, SHUT_RDWR);
-    }
-    /* close the listen fd so threads blocked in accept() wake up */
-    int fd = g_listen_fd;
-    if (fd >= 0) {
-        g_listen_fd = -1;
-        close(fd);
-    }
-}
+static void sig_handler(int sig) { (void)sig; g_running = 0; }
 
-static int handle_client(int fd, CUstream stream, char *iobuf)
+static int handle_client(int fd)
 {
     if (nbd_handshake(fd, g_vram_size) != 0) {
         fprintf(stderr, "[nbd-vram] handshake failed\n");
         return -1;
     }
     printf("[nbd-vram] handshake OK, entering transmission mode\n");
+
+    char *iobuf = malloc(IO_BUF_SIZE);
+    if (!iobuf) return -1;
 
     int ret = 0;
     while (g_running) {
@@ -429,7 +388,7 @@ static int handle_client(int fd, CUstream stream, char *iobuf)
                 uint32_t chunk = (remaining > IO_BUF_SIZE) ? IO_BUF_SIZE : remaining;
                 if (recv_all(fd, iobuf, chunk) != 0) { ret = -1; goto done; }
                 if (!error) {
-                    CUresult r = _cuMemcpyHtoDAsync(g_vram_ptr + voff, iobuf, chunk, stream);
+                    CUresult r = _cuMemcpyHtoD(g_vram_ptr + voff, iobuf, chunk);
                     if (r != CUDA_SUCCESS) {
                         fprintf(stderr, "[nbd-vram] HtoD failed: %s\n", cuda_err(r));
                         error = EIO;
@@ -438,10 +397,10 @@ static int handle_client(int fd, CUstream stream, char *iobuf)
                 }
                 remaining -= chunk;
             }
-            if (!error) _cuStreamSynchronize(stream);
+            if (!error) _cuCtxSynchronize();
 
         } else if (cmd == NBD_CMD_FLUSH) {
-            _cuStreamSynchronize(stream);
+            _cuCtxSynchronize();
         }
         /* TRIM: just ack success, VRAM doesn't need trimming */
 
@@ -462,12 +421,12 @@ static int handle_client(int fd, CUstream stream, char *iobuf)
             uint64_t voff      = offset;
             while (remaining > 0) {
                 uint32_t chunk = (remaining > IO_BUF_SIZE) ? IO_BUF_SIZE : remaining;
-                CUresult r = _cuMemcpyDtoHAsync(iobuf, g_vram_ptr + voff, chunk, stream);
+                CUresult r = _cuMemcpyDtoH(iobuf, g_vram_ptr + voff, chunk);
                 if (r != CUDA_SUCCESS) {
                     fprintf(stderr, "[nbd-vram] DtoH failed: %s\n", cuda_err(r));
                     ret = -1; goto done;
                 }
-                _cuStreamSynchronize(stream);
+                _cuCtxSynchronize();
                 if (send_all(fd, iobuf, chunk) != 0) { ret = -1; goto done; }
                 remaining -= chunk;
                 voff      += chunk;
@@ -475,44 +434,8 @@ static int handle_client(int fd, CUstream stream, char *iobuf)
         }
     }
 done:
+    free(iobuf);
     return ret;
-}
-
-/* -------------------------------------------------------------------------
- * Thread worker - one per NBD connection slot
- * ---------------------------------------------------------------------- */
-
-static void *thread_worker(void *arg)
-{
-    int idx = (int)(intptr_t)arg;
-    CUstream stream;
-    void *iobuf = NULL;
-    /* PF_MEMALLOC_NOIO/PF_LOCAL_THROTTLE are per-task; pthread inheritance of
-     * PR_SET_IO_FLUSHER is undocumented, so set it per worker too (cheap, the
-     * failure case is already logged once from main). */
-    prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0);
-    _cuCtxSetCurrent(g_cu_ctx);
-    _cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING);
-    /* Pinned host memory: eliminates CUDA driver staging copy for each DMA */
-    _cuMemAllocHost(&iobuf, IO_BUF_SIZE);
-
-    while (g_running) {
-        int cfd = accept(g_listen_fd, NULL, NULL);
-        if (cfd < 0) {
-            if (errno == EINTR) continue;
-            break;  /* EBADF after signal handler closes g_listen_fd */
-        }
-        g_client_fds[idx] = cfd;
-        printf("[nbd-vram] client connected\n");
-        handle_client(cfd, stream, iobuf);
-        g_client_fds[idx] = -1;
-        close(cfd);
-        printf("[nbd-vram] client disconnected\n");
-    }
-
-    if (iobuf) _cuMemFreeHost(iobuf);
-    _cuStreamDestroy(stream);
-    return NULL;
 }
 
 /* -------------------------------------------------------------------------
@@ -522,6 +445,7 @@ static void *thread_worker(void *arg)
 int main(void)
 {
     CUdevice  cu_dev;
+    CUcontext cu_ctx = NULL;
     int       ret    = 1;
 
     signal(SIGTERM, sig_handler);
@@ -532,15 +456,7 @@ int main(void)
      * the page fault back through this daemon, deadlocking under swap pressure.
      * Requires LimitMEMLOCK=infinity in the systemd service. */
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
-        fprintf(stderr, "[nbd-vram] mlockall failed (%s) - daemon pages may be swapped, risking deadlock\n",
-                strerror(errno));
-
-    /* Mark the daemon as part of the I/O flush path. Sets PF_MEMALLOC_NOIO +
-     * PF_LOCAL_THROTTLE so allocations made while servicing a swap write do not
-     * recurse back into reclaim/writeback - that recursion is the swap-over-NBD
-     * deadlock at zero free RAM. Per-process; set before threads spawn. */
-    if (prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0) != 0)
-        fprintf(stderr, "[nbd-vram] PR_SET_IO_FLUSHER failed (%s) - deadlock risk under swap pressure\n",
+        fprintf(stderr, "[nbd-vram] mlockall failed (%s) — daemon pages may be swapped, risking deadlock\n",
                 strerror(errno));
 
     if (load_libcuda() != 0) goto out;
@@ -557,7 +473,7 @@ int main(void)
     }
 
     if (_cuDeviceGet(&cu_dev, 0) != CUDA_SUCCESS) goto out;
-    if (_cuCtxCreate(&g_cu_ctx, CU_CTX_SCHED_AUTO, cu_dev) != CUDA_SUCCESS) goto out;
+    if (_cuCtxCreate(&cu_ctx, CU_CTX_SCHED_AUTO, cu_dev) != CUDA_SUCCESS) goto out;
 
     const char *env = getenv("VRAM_SETUP_SIZE_MB");
     size_t mb = env ? (size_t)atol(env) : DEFAULT_SIZE_MB;
@@ -593,9 +509,9 @@ int main(void)
             { perror("bind"); goto out_cuda; }
     }
     chmod(SOCK_PATH, 0600);
-    if (listen(g_listen_fd, g_nbd_threads + 1) < 0) { perror("listen"); goto out_cuda; }
+    if (listen(g_listen_fd, 1) < 0) { perror("listen"); goto out_cuda; }
 
-    printf("[nbd-vram] listening on %s (%d threads)\n", SOCK_PATH, g_nbd_threads);
+    printf("[nbd-vram] listening on %s\n", SOCK_PATH);
 
     /* sd_notify READY=1 */
     {
@@ -613,31 +529,28 @@ int main(void)
         }
     }
 
-    {
-        const char *tenv = getenv("VRAM_NBD_THREADS");
-        if (tenv) {
-            g_nbd_threads = atoi(tenv);
-            if (g_nbd_threads < 1) g_nbd_threads = 1;
-            if (g_nbd_threads > NBD_THREADS_MAX) g_nbd_threads = NBD_THREADS_MAX;
-        }
+    while (g_running) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(g_listen_fd, &rfds);
+        struct timeval tv = { .tv_sec = 1 };
+        if (select(g_listen_fd + 1, &rfds, NULL, NULL, &tv) <= 0) continue;
 
-        pthread_t threads[NBD_THREADS_MAX];
-        for (int i = 0; i < g_nbd_threads; i++) g_client_fds[i] = -1;
-        for (int i = 0; i < g_nbd_threads; i++)
-            pthread_create(&threads[i], NULL, thread_worker, (void *)(intptr_t)i);
-        for (int i = 0; i < g_nbd_threads; i++)
-            pthread_join(threads[i], NULL);
+        int cfd = accept(g_listen_fd, NULL, NULL);
+        if (cfd < 0) { if (errno == EINTR) continue; break; }
+
+        printf("[nbd-vram] client connected\n");
+        handle_client(cfd);
+        close(cfd);
+        printf("[nbd-vram] client disconnected\n");
     }
     ret = 0;
 
 out_cuda:
-    if (g_listen_fd >= 0) {
-        close(g_listen_fd);
-        g_listen_fd = -1;
-    }
+    close(g_listen_fd);
     unlink(SOCK_PATH);
     if (g_vram_ptr) _cuMemFree(g_vram_ptr);
-    if (g_cu_ctx)   _cuCtxDestroy(g_cu_ctx);
+    if (cu_ctx)     _cuCtxDestroy(cu_ctx);
     if (g_libcuda)  dlclose(g_libcuda);
 out:
     printf("[nbd-vram] exiting (ret=%d)\n", ret);

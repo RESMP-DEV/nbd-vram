@@ -5,14 +5,6 @@ set -e
 
 modprobe nbd max_part=0 2>/dev/null || true
 
-# Clean up any device left over from a previous unclean shutdown
-if [ -f /run/nbd-vram-dev ]; then
-    PREV=$(cat /run/nbd-vram-dev)
-    swapoff "$PREV" 2>/dev/null || true
-    nbd-client -d "$PREV" 2>/dev/null || true
-    rm -f /run/nbd-vram-dev
-fi
-
 # Find first free /dev/nbdN by checking kernel's pid file for each device
 NBD_DEV=""
 for dev in /dev/nbd{0..15}; do
@@ -30,9 +22,7 @@ if [ -z "$NBD_DEV" ]; then
 fi
 
 echo "nbd-vram-connect: using $NBD_DEV"
-# Force-disconnect to clear any stale kernel state from an unclean previous shutdown
-nbd-client -d "$NBD_DEV" 2>/dev/null || true
-nbd-client -unix /run/nbd-vram.sock "$NBD_DEV" -connections ${VRAM_NBD_CONNECTIONS:-4}
+nbd-client -unix /run/nbd-vram.sock "$NBD_DEV"
 mkswap "$NBD_DEV"
 swapon "$NBD_DEV" -p "${VRAM_SWAP_PRIORITY:-1500}"
 

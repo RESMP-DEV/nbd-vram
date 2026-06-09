@@ -22,22 +22,6 @@ No kernel module to write or maintain. No NVIDIA kernel symbols. Survives kernel
 
 ---
 
-## What it's for
-
-NBD-VRAM is a free, low-wear tier of swap that makes a machine feel better under memory pressure. The benchmarks below don't fully capture why, because what you actually feel day to day is latency. When a process touches a paged-out page it stalls until swap answers: on an NVMe waking from a power-saving sleep that stall is milliseconds, felt as a stutter; on VRAM it is microseconds, with no stutter at all. Same idea as any swap, smoother machine, out of memory that was otherwise sitting idle.
-
-Best of all, there's nothing you need to tune to get it to work as thread count auto-scales to your CPU.
-
-Three main situations where you can benefit from NBD-VRAM:
-
-**Sporadic pressure** a background app paging in, or switching back to something you left open hours ago. Single faults answered in ~250 us instead of milliseconds, so no stutter.
-
-**Concurrent pressure** parallel compiles (`make -j`), dozens of browser tabs, VMs, data jobs spilling RAM. Many CPUs faulting at once, where the daemon's threads fan the I/O across all its connections and keep up.
-
-**Spare your SSD** swap is write-heavy, and sending that churn to VRAM instead of finite NAND saves write cycles, which matters most on the soldered-storage laptops this is built for.
-
----
-
 ## Why not the NVIDIA P2P API?
 
 The "obvious" approach is `nvidia_p2p_get_pages_persistent`, which pins VRAM pages in BAR1 so the CPU can access them directly via `ioremap_wc`. Every existing project that tried this route hits the same wall: the NVIDIA driver returns `EINVAL` on consumer GeForce GPUs. Both the persistent and non-persistent variants, both flag values. It's gated at the RM level for Quadro/datacenter SKUs only, regardless of driver version.
@@ -85,14 +69,10 @@ Edit `/etc/systemd/system/vram-swap-nbd.service`:
 
 ```ini
 Environment=VRAM_SETUP_SIZE_MB=7168    # how much VRAM to use
-Environment=VRAM_SWAP_PRIORITY=1500    # swap priority (higher = used first)
-Environment=VRAM_NBD_THREADS=8         # worker threads; install.sh sets this to nproc
-Environment=VRAM_NBD_CONNECTIONS=8     # nbd connections; keep equal to threads
+Environment=VRAM_SWAP_PRIORITY=1500   # swap priority (higher = used first)
 ```
 
 The daemon tries the requested size first and backs off in 512 MiB steps if the GPU is short on memory - so it will grab as much as it can even if the display compositor is already loaded. `VRAM_SETUP_SIZE_MB` is the ceiling, not a hard requirement.
-
-`VRAM_NBD_THREADS` / `VRAM_NBD_CONNECTIONS` are auto-set to `nproc` at install and should match each other. More connections let the daemon drain concurrent swap I/O in parallel; the benefit saturates around your physical core count, and single-stream workloads do not use it at all (see Performance).
 
 After changing, run `sudo systemctl daemon-reload && sudo systemctl restart vram-swap-nbd`.
 
@@ -103,20 +83,6 @@ After changing, run `sudo systemctl daemon-reload && sudo systemctl restart vram
 The installer asks whether to enable power-aware management on first install. If enabled, the service automatically stops when you unplug from AC (or when battery drops below a threshold), and restarts when power is restored. Manual `systemctl stop` is always respected and won't be overridden.
 
 To change settings after install, edit `/etc/nbd-vram.conf`. Changes take effect on the next poll (within 60 seconds) or immediately on the next AC plug/unplug event.
-
----
-
-## Using the GPU at the same time
-
-NBD-VRAM uses your VRAM, so while it is active that memory is not available to anything else on the card. The installer asks how much to allocate and suggests an amount based on your setup: if this card does not drive a display (a hybrid laptop, or a workstation with a separate display GPU) it recommends nearly all of the VRAM, since the card is otherwise idle; if it does drive your display, it leaves headroom for the desktop and games. Whatever you choose, a GPU app started afterwards only gets the slice that is left, and if memory is being swapped while the GPU is busy the card does both jobs at once - rendering and serving swap copies - and neither is happy.
-
-If you want to use the GPU heavily at the same time, pick one:
-
-**Leave headroom** choose a smaller allocation when the installer asks, or change `VRAM_SETUP_SIZE_MB` in `/etc/systemd/system/vram-swap-nbd.service` later (e.g. `4096` keeps 4 GB for the GPU).
-
-**Stop it while you need the card** `sudo systemctl stop vram-swap-nbd`, then start it again afterwards. Swapped pages migrate back to RAM and other swap first.
-
-This is the natural trade-off of swapping to VRAM: it is free memory, right up until you want the GPU for something else.
 
 ---
 
@@ -140,107 +106,78 @@ Writes the entire VRAM partition with zeros, verifies a sample read back, then a
 
 ## Memory safety
 
-The daemon backs a swap device, which creates two subtle deadlock risks under heavy memory pressure. Both froze early builds; both are now handled. Together they are why the daemon stays responsive while the entire VRAM swap fills at zero free RAM.
+The daemon runs as a swap device, which creates a subtle risk: if the kernel tries to page out the daemon's own memory under swap pressure, it routes that page fault back through the same daemon. The daemon is single-threaded and already mid-request, so it deadlocks. The result is a full system hang.
 
-1. The kernel must never page out the daemon's own memory, or a fault on it would route back through the busy daemon and hang. The daemon pins all its pages in RAM with `mlockall(MCL_CURRENT | MCL_FUTURE)`.
+To prevent this, the daemon calls `mlockall(MCL_CURRENT | MCL_FUTURE)` on startup, which pins all current and future pages into RAM so the kernel can never evict them. The systemd service sets `LimitMEMLOCK=infinity` to allow it.
 
-2. While serving a swap write the daemon still needs to allocate memory, and at zero free RAM that allocation would normally trigger reclaim - which is itself waiting on the very write the daemon is doing. The daemon marks itself with `prctl(PR_SET_IO_FLUSHER)` (the same mechanism the kernel uses for the nbd socket, and what NFS-Ganesha and libfuse use) so its allocations never fall into that trap. It also runs with `OOMScoreAdjust=-1000`, so the kernel never kills it under pressure.
+You can verify it is working after the service starts:
 
-The daemon is multi-threaded - one worker and one connection per CPU - so it keeps up with concurrent swap traffic instead of saturating and stalling the system.
+```sh
+grep -E 'VmLck|VmSwap' /proc/$(pgrep nbd-vram)/status
+# VmLck:  12116160 kB   <- non-zero, daemon pages are locked
+# VmSwap:        0 kB   <- kernel has not paged any daemon memory out
+```
+
+`VmLck` will appear much larger than `VmRSS` - that is normal. `mlockall` locks the entire address space including the CUDA device memory mappings, which live in VRAM rather than RAM.
 
 ---
 
 ## Performance
 
-Tested on RTX 3070 Laptop (8 GB VRAM), Ryzen 9 5900HX, kernel 6.17, Pop!_OS, against NVMe cryptswap (dm-crypt, PCIe 4.0). O_DIRECT. Each test was run 3 times; the numbers and the gif for each are from a representative (median) run.
+Tested on RTX 3070 Laptop (8 GB VRAM), kernel 6.17, Pop!_OS. Compared against NVMe cryptswap (dm-crypt, PCIe 4.0). All benchmarks run with O_DIRECT to bypass page cache.
 
-NBD-VRAM turns otherwise-idle VRAM into a fast, zero-wear tier of swap. Its strengths are the ones that matter for everyday use: microsecond latency for the sporadic page faults that make a machine feel laggy, no SSD wear, and stable behaviour under heavy pressure. It sits above your SSD swap in priority, so it absorbs pressure first - for free.
-
-Run any of these yourself (state is restored on exit; `fio`/`ioping` auto-install):
+Three benchmarks are in `benchmarks/`. Each runs NVMe first, then starts the VRAM service and runs the same test against the block device. State is restored on exit.
 
 ```sh
-sudo bash benchmarks/bench-latency.sh         # per-operation latency
-sudo bash benchmarks/bench-iops-parallel.sh   # 4K IOPS under concurrent load
-sudo bash benchmarks/bench-iops.sh            # 4K IOPS, light/sporadic access
-sudo bash benchmarks/bench-throughput.sh      # sequential dd
-sudo bash benchmarks/bench-pressure.sh        # survival under heavy pressure
+sudo bash benchmarks/bench-throughput.sh   # sequential read/write (dd, 2 GiB, O_DIRECT)
+sudo bash benchmarks/bench-iops.sh         # 4K random IOPS (fio, libaio, iodepth=32)
+sudo bash benchmarks/bench-latency.sh      # per-operation latency (ioping, 20 requests)
 ```
 
----
-
-### Latency
-
-![bench-latency](benchmarks/bench-latency.gif)
-
-| Device | min | avg | max |
-|--------|-----|-----|-----|
-| NVMe | 115 us | 8.7 ms | 10.1 ms |
-| NBD-VRAM | 90 us | **257 us** | 437 us |
-
-**About 34x lower average latency.** An NVMe drive sleeps between sporadic requests (APST power saving) and wakes cold almost every time, paying a multi-millisecond penalty. VRAM has no power states - it answers in microseconds, every time. This is the case that dominates real desktop use: memory pressure is usually individual 4K page faults arriving seconds apart, each one stalling a process until swap responds. At ~9 ms per fault you feel it; at 257 us you don't.
+`fio` and `ioping` are installed automatically if missing.
 
 ---
 
-### Concurrent 4K IOPS
-
-![bench-iops-parallel](benchmarks/bench-iops-parallel.gif)
-
-Under concurrent pressure - every CPU faulting at once, as in a parallel build or a wall of browser tabs - the daemon's worker threads spread requests across all its connections:
-
-| Device | IOPS | bandwidth |
-|--------|------|-----------|
-| NVMe | 240k | 936 MiB/s |
-| NBD-VRAM | **312k** | 1219 MiB/s |
-
-Multi-threading is what gets NBD-VRAM here: single-threaded it manages ~77k on this workload, multi-threaded ~312k - a ~4x gain, and well past what swap demand needs. NVMe's concurrent IOPS swings hard with drive temperature: throttled under this sustained run it fell to 240k (below NBD-VRAM), while a cool drive measures far higher (~860k). NBD-VRAM holds steady around 310k either way.
-
----
-
-### Single-stream 4K IOPS
-
-![bench-iops](benchmarks/bench-iops.gif)
-
-| Device | read IOPS | write IOPS | bandwidth |
-|--------|-----------|------------|-----------|
-| NVMe | 59k | 59k | 229 MiB/s |
-| NBD-VRAM | 42k | 42k | 165 MiB/s |
-
-One process faulting at a time - the light case. Only one request is ever in flight, so thread count makes no difference here, and both devices are far quicker than sporadic access needs.
-
----
-
-### Sequential throughput
+### Sequential throughput (dd, 2 GiB)
 
 ![bench-throughput](benchmarks/bench-throughput.gif)
 
-| Device | write | read |
+| Device | Write | Read |
 |--------|-------|------|
-| NVMe | 2.8 GB/s | 3.1 GB/s |
-| NBD-VRAM | 1.9 GB/s | 2.7 GB/s |
+| NVMe | 2.7 GB/s | 2.9 GB/s |
+| VRAM (nbd) | 1.1 GB/s | 2.3 GB/s |
 
-Big sequential streams are an NVMe's home turf, and they are not how swap behaves - the kernel moves random 4K pages, not multi-megabyte streams. Shown for completeness; ~2 GB/s is plenty for swapping a stream back in.
-
----
-
-### Surviving heavy pressure
-
-![bench-pressure](benchmarks/bench-pressure.gif)
-
-Fill the entire 7 GB VRAM swap with RAM at zero free, and the machine stays responsive - no freeze, no deadlock. Earlier single-threaded builds hard-froze here; the multi-threaded daemon plus the two safeguards in [Memory safety](#memory-safety) keep it alive.
+VRAM is slower for large sequential transfers. The bottleneck is the NBD + CUDA userspace round-trip - every block crosses a Unix socket and a `cuMemcpy` call, which adds overhead that NVMe's direct kernel block path doesn't pay. Sequential throughput is not the primary swap workload (the kernel swaps individual 4K pages, not 4 MiB streams) - see the IOPS and latency benchmarks below.
 
 ---
 
-### GPU under load stress test
+### 4K random IOPS (fio, libaio, iodepth=32)
 
-The nastier test I ran was using the GPU *while* it was swapping: a 3D render plus a CUDA compute load on the NVIDIA card, with RAM driven to zero so swap floods the same VRAM. It degrades gracefully rather than falling over - the GPU app keeps rendering (the card pegged near 100%), the daemon keeps serving swap, and the machine stays usable, just laggy. Nothing crashed.
+![bench-iops](benchmarks/bench-iops.gif)
 
-The only hard limit is capacity, not stability: while the daemon holds its VRAM, a GPU app gets only what is left, so a large allocation simply fails to start. That is a tuning question, not a crash - see [Using the GPU at the same time](#using-the-gpu-at-the-same-time).
+| Device | Read IOPS | Write IOPS | Avg latency |
+|--------|-----------|------------|-------------|
+| NVMe | 45.4k | 45.3k | 343 us |
+| VRAM (nbd) | 28.7k | 28.7k | 550 us |
+
+NVMe wins for sustained random I/O. At iodepth=32, NVMe can have 32 requests genuinely in flight simultaneously; the NBD+CUDA path serialises them through the daemon, so the depth advantage is reduced. The VRAM daemon also adds CPU overhead that the NVMe path does not pay. For continuous high-throughput swap pressure, NVMe is faster.
+
+The picture changes for sporadic access - see the latency benchmark below.
 
 ---
 
-### SSD wear
+### Per-operation latency (ioping, 4K reads, 1 request/sec)
 
-Swap is write-heavy, and SSD NAND has a finite number of write cycles. Sending that churn to VRAM (DRAM-like, no wear) instead of your SSD spares its endurance - which matters most on exactly the soldered-everything laptops this is built for.
+![bench-latency](benchmarks/bench-latency.gif)
+
+| Device | Min | Avg | Max |
+|--------|-----|-----|-----|
+| NVMe | 120 us | 9.05 ms | 10.1 ms |
+| VRAM (nbd) | 134 us | 335 us | 490 us |
+
+**VRAM is 27x faster average latency.** The NVMe drive is physically capable of ~112 us (visible on the warmup request) but APST (Autonomous Power State Transitions) puts it to sleep between requests. At 1 request per second - the rate of sporadic swap access - it wakes cold almost every time and pays a ~9 ms penalty. VRAM has no power states and responds in 133-490 us consistently.
+
+This is the scenario that matters most in practice. Memory pressure on a laptop is rarely a sustained GB/s flood - it is individual 4K page faults arriving seconds apart. Every one of those faults stalls waiting for the swap device to respond. At 9 ms per fault, NVMe swap is felt. At 335 us, VRAM swap is not.
 
 ---
 

@@ -47,7 +47,7 @@ trap cleanup EXIT
 clear
 sleep 1
 
-echo "# NBD-VRAM vs NVMe - per-operation latency (ioping, sporadic single faults)"
+echo "# VRAM swap vs NVMe — per-operation latency (ioping)"
 echo "# 4K sequential reads, $IOPING_COUNT requests each"
 sleep 1
 
@@ -107,16 +107,8 @@ sleep 1.5
 echo ""
 echo "# ── results (min/avg/max/mdev latency) ────────────"
 sleep 0.5
-# highlight the lower-latency device
-GREEN=$'\033[1;32m'; RESET=$'\033[0m'; NV=""; VR=""
-lat_field() { echo "$1" | awk -F'/' -v f="$2" '{v=$f; n=v+0; if(v ~ /ms/) n*=1000; print n}'; }
-if awk "BEGIN{exit !( $(lat_field "$VRAM_LAT" 2) <= $(lat_field "$NVME_LAT" 2) )}"; then VR=$GREEN; else NV=$GREEN; fi
-printf "  ${NV}NVMe (%s):  %s${RESET}\n" "$NVME_PART" "$NVME_LAT"
-printf "  ${VR}NBD-VRAM (%s):  %s${RESET}\n" "$VRAM_DEV" "$VRAM_LAT"
-# Optional machine-readable result line (set BENCH_RESULT_FILE to capture): nvme_min nvme_avg nvme_max vram_min vram_avg vram_max
-[ -n "${BENCH_RESULT_FILE:-}" ] && printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$(lat_field "$NVME_LAT" 1)" "$(lat_field "$NVME_LAT" 2)" "$(lat_field "$NVME_LAT" 3)" \
-    "$(lat_field "$VRAM_LAT" 1)" "$(lat_field "$VRAM_LAT" 2)" "$(lat_field "$VRAM_LAT" 3)" >> "$BENCH_RESULT_FILE"
+printf "  NVMe (%s):  %s\n" "$NVME_PART" "$NVME_LAT"
+printf "  VRAM (%s):  %s\n" "$VRAM_DEV" "$VRAM_LAT"
 sleep 1.5
 
 echo ""

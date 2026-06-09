@@ -1,8 +1,5 @@
 #!/bin/bash
-# bench-iops.sh - VRAM swap vs NVMe: SINGLE-STREAM 4K random IOPS (fio numjobs=1).
-# Models light / sporadic memory pressure (one process faulting at a time). For the
-# concurrent-pressure picture, where the daemon's threads scale, see
-# bench-iops-parallel.sh (numjobs=16).
+# bench-iops.sh - VRAM swap vs NVMe: 4K random IOPS (fio, libaio, iodepth=32)
 # NVMe test runs first (no service needed), then VRAM swap is started for the VRAM test.
 # State: restores VRAM swap when done; stops service only if this script started it.
 
@@ -67,7 +64,7 @@ trap cleanup EXIT
 clear
 sleep 1
 
-echo "# NBD-VRAM vs NVMe - single-stream 4K random I/O (fio numjobs=1, light access)"
+echo "# VRAM swap vs NVMe — 4K random I/O (fio)"
 echo "# 4K blocks mirror real swap page size; $FIO_SIZE working set, ${FIO_RUNTIME}s runs"
 sleep 1
 
@@ -128,17 +125,10 @@ sleep 1.5
 echo ""
 echo "# ── results (4K randrw, iodepth=$FIO_IODEPTH, libaio) ──────────────"
 sleep 0.5
-# highlight the higher-IOPS device
-GREEN=$'\033[1;32m'; RESET=$'\033[0m'; NV=""; VR=""
-iops_num() { awk -v s="$1" 'BEGIN{n=s+0; if(s ~ /k/) n*=1000; print n}'; }
-if awk "BEGIN{exit !( $(iops_num "$NVME_READ_IOPS") >= $(iops_num "$VRAM_READ_IOPS") )}"; then NV=$GREEN; else VR=$GREEN; fi
-printf "  ${NV}%-14s  read: %-10s %-12s  write: %-10s %s${RESET}\n" \
+printf "  %-14s  read: %-10s %-12s  write: %-10s %s\n" \
     "NVMe" "${NVME_READ_IOPS} IOPS" "$NVME_READ_BW" "${NVME_WRITE_IOPS} IOPS" "$NVME_WRITE_BW"
-printf "  ${VR}%-14s  read: %-10s %-12s  write: %-10s %s${RESET}\n" \
-    "NBD-VRAM" "${VRAM_READ_IOPS} IOPS" "$VRAM_READ_BW" "${VRAM_WRITE_IOPS} IOPS" "$VRAM_WRITE_BW"
-# Optional machine-readable result line (set BENCH_RESULT_FILE to capture): nvme_r nvme_w vram_r vram_w
-[ -n "${BENCH_RESULT_FILE:-}" ] && printf '%s\t%s\t%s\t%s\n' \
-    "$(iops_num "$NVME_READ_IOPS")" "$(iops_num "$NVME_WRITE_IOPS")" "$(iops_num "$VRAM_READ_IOPS")" "$(iops_num "$VRAM_WRITE_IOPS")" >> "$BENCH_RESULT_FILE"
+printf "  %-14s  read: %-10s %-12s  write: %-10s %s\n" \
+    "VRAM" "${VRAM_READ_IOPS} IOPS" "$VRAM_READ_BW" "${VRAM_WRITE_IOPS} IOPS" "$VRAM_WRITE_BW"
 sleep 1.5
 
 echo ""
