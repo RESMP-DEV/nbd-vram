@@ -1,4 +1,6 @@
 # nbd-vram
+## this is alpha software. use at own risk. 
+### If you run into trouble, boot, switch to TTY and run the uninstall script `sudo bash uninstall` from the path you installed NBD-VRAM from
 
 Use your NVIDIA GPU's VRAM as swap space on Linux.
 
