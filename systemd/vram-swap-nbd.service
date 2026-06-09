@@ -1,6 +1,9 @@
 [Unit]
 Description=VRAM Swap via NBD (CUDA memcpy backend)
-After=systemd-modules-load.service nvidia-persistenced.service
+# Start after the display manager so the GUI initialises the NVIDIA GPU (PRIME
+# offload) and claims its VRAM first. Grabbing VRAM before that on a cold boot can
+# starve Xorg and crash it, leaving a blinking cursor. (Ignored if no display-manager.)
+After=systemd-modules-load.service nvidia-persistenced.service display-manager.service
 Wants=nvidia-persistenced.service
 
 [Service]
@@ -11,19 +14,27 @@ NotifyAccess=main
 # RTX 3070 (8GB): 7168 leaves ~1GB for display/compute.
 Environment=VRAM_SETUP_SIZE_MB=7168
 Environment=VRAM_SWAP_PRIORITY=1500
+Environment=VRAM_NBD_THREADS=4
+Environment=VRAM_NBD_CONNECTIONS=4
 
 # Wake GPU before CUDA init to avoid GSP RPC timeout (Xid 119 on laptops)
 ExecStartPre=/usr/bin/nvidia-smi -pm 1
+# Swap aggressively before RAM fills so the kernel never runs out of memory
+# to process swap requests. Reset on stop by nbd-vram-disconnect.sh.
+ExecStartPre=/sbin/sysctl -w vm.swappiness=200 vm.min_free_kbytes=524288
 
 ExecStart=/usr/local/bin/nbd-vram
 ExecStartPost=/usr/local/bin/nbd-vram-connect.sh
 ExecStop=/usr/local/bin/nbd-vram-disconnect.sh
 
 LimitMEMLOCK=infinity
+OOMScoreAdjust=-1000
 
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=60
+# Backstop so a stuck stop can never hang shutdown for the default 90s
+TimeoutStopSec=15
 KillMode=process
 StandardOutput=journal
 StandardError=journal
