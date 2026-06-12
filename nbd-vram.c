@@ -24,6 +24,7 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <pthread.h>
+#include <time.h>
 
 /* PR_SET_IO_FLUSHER (Linux 5.6+) may be absent from older headers */
 #ifndef PR_SET_IO_FLUSHER
@@ -360,11 +361,32 @@ static uint64_t     g_vram_size;
 static CUcontext    g_cu_ctx;
 static int          g_listen_fd  = -1;
 static volatile int g_running    = 1;
+static volatile sig_atomic_t g_term_requested = 0;
 static int          g_nbd_threads = NBD_THREADS_DEFAULT;
 static volatile int g_client_fds[NBD_THREADS_MAX];
 
+static int clients_connected(void) {
+    for (int i = 0; i < g_nbd_threads; i++)
+        if (g_client_fds[i] >= 0) return 1;
+    return 0;
+}
+
 static void sig_handler(int sig) {
     (void)sig;
+    g_term_requested = 1;
+    /* A connected client means the kernel may still have live swap pages on
+     * this device. Dying now frees the VRAM behind them - the kernel reads
+     * the failed page-in as hardware memory corruption and MCE-kills every
+     * process that had pages swapped, PID 1 included. Do NOT exit; keep
+     * serving until swapoff completes and nbd-client -d drops the
+     * connection, then the workers finish the exit. */
+    if (clients_connected()) {
+        static const char msg[] =
+            "[nbd-vram] SIGTERM with client attached - draining, exit deferred until swap detaches\n";
+        ssize_t w = write(STDERR_FILENO, msg, sizeof(msg) - 1);
+        (void)w;
+        return;
+    }
     g_running = 0;
     /* shutdown active client sockets so threads blocked in recv_all() unblock.
      * Threads waiting for a new connection wake on their own via the poll()
@@ -495,6 +517,19 @@ static void *thread_worker(void *arg)
     _cuMemAllocHost(&iobuf, IO_BUF_SIZE);
 
     while (g_running) {
+        /* Draining (SIGTERM arrived with a client attached): take no new
+         * connections, just wait for the remaining clients to detach. The
+         * thread that sees the last one go flips g_running for everyone. */
+        if (g_term_requested) {
+            if (!clients_connected()) {
+                g_running = 0;
+                printf("[nbd-vram] drain complete - last client gone, exiting\n");
+                break;
+            }
+            struct timespec ts = { 0, 100 * 1000 * 1000 };
+            nanosleep(&ts, NULL);
+            continue;
+        }
         /* Wait for a connection with a 1s timeout so the loop re-checks
          * g_running and exits promptly on SIGTERM (a bare blocking accept()
          * cannot be woken by the signal handler, which hung shutdown for 90s). */

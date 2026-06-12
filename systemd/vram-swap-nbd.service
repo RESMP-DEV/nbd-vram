@@ -33,8 +33,17 @@ OOMScoreAdjust=-1000
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=60
-# Backstop so a stuck stop can never hang shutdown for the default 90s
-TimeoutStopSec=15
+# Stop runs swapoff (ExecStop), which migrates every in-use page off the
+# device - minutes when GBs are swapped. 15s here killed swapoff mid-flight,
+# then the daemon, freeing VRAM that still backed live swap pages; the kernel
+# read that as memory corruption and MCE-killed processes up to PID 1. The
+# daemon exits promptly once swap detaches, so a long timeout only ever waits
+# on real swapoff work.
+TimeoutStopSec=1800
+# If the stop times out anyway (swapoff stuck/failed), do NOT SIGKILL - a
+# killed daemon takes live swap pages with it (same crash). Leave it running
+# in drain mode, let the unit fail, retry the stop once RAM frees up.
+SendSIGKILL=no
 KillMode=process
 StandardOutput=journal
 StandardError=journal
