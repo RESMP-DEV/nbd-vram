@@ -174,6 +174,16 @@ static const char *cuda_err(CUresult r) {
 #define NBD_CMD_FLUSH        3
 #define NBD_CMD_TRIM         4
 
+/* 28-byte NBD request header, shared by the per-op and batched paths */
+struct nbd_req_hdr {
+    uint32_t magic;
+    uint16_t flags;
+    uint16_t type;
+    uint64_t handle;   /* opaque, echoed back verbatim (stays network order) */
+    uint64_t from;
+    uint32_t len;
+} __attribute__((packed));
+
 /* -------------------------------------------------------------------------
  * I/O helpers
  * ---------------------------------------------------------------------- */
@@ -356,6 +366,14 @@ static int nbd_handshake(int fd, uint64_t vram_size)
 #define NBD_THREADS_MAX     64
 #define NBD_THREADS_DEFAULT  4
 
+/* Request-level batching: drain up to N already-queued requests, issue all their
+ * VRAM copies, then ONE cuStreamSynchronize for the whole batch. Amortises both
+ * the per-op socket round-trip and the per-op CUDA launch+sync (the two halves of
+ * the small-IO floor). Requests larger than a slot fall back to the per-op path. */
+#define BATCH_SLOT          (64 * 1024)   /* max per-request size that batches */
+#define BATCH_DEPTH_DEFAULT 32
+#define BATCH_DEPTH_MAX     256
+
 static CUdeviceptr  g_vram_ptr;
 static uint64_t     g_vram_size;
 static CUcontext    g_cu_ctx;
@@ -364,6 +382,14 @@ static volatile int g_running    = 1;
 static volatile sig_atomic_t g_term_requested = 0;
 static int          g_nbd_threads = NBD_THREADS_DEFAULT;
 static volatile int g_client_fds[NBD_THREADS_MAX];
+static int          g_batch_enabled = 1;                  /* VRAM_BATCH=0 disables */
+static int          g_batch_depth   = BATCH_DEPTH_DEFAULT; /* VRAM_BATCH_DEPTH */
+static int          g_batch_debug   = 0;                  /* VRAM_BATCH_DEBUG=1 */
+static unsigned long g_batch_count   = 0;                  /* flushes that coalesced (n>1) */
+static unsigned long g_batch_ops     = 0;                  /* ops in those n>1 flushes */
+static unsigned long g_flush_count   = 0;                  /* every batched-path flush, incl n==1 */
+static unsigned long g_flush_ops     = 0;                  /* ops across all flushes (true depth) */
+static unsigned long g_legacy_ops    = 0;                  /* READ/WRITE via the per-op path */
 
 static int clients_connected(void) {
     for (int i = 0; i < g_nbd_threads; i++)
@@ -398,7 +424,184 @@ static void sig_handler(int sig) {
     }
 }
 
-static int handle_client(int fd, CUstream stream, char *iobuf)
+/* One NBD response header */
+struct nbd_resp_hdr {
+    uint32_t magic;
+    uint32_t error;
+    uint64_t handle;
+} __attribute__((packed));
+
+/* One batched op: a READ or WRITE that fits in a slot of the pinned batch buffer */
+struct bop {
+    uint64_t handle;   /* network order, echoed verbatim */
+    uint64_t offset;
+    uint32_t len;
+    uint16_t cmd;
+    uint32_t error;
+    char    *slot;     /* host staging memory for this op */
+};
+
+/* Overflow-safe bounds check against the VRAM device. Written as
+ * offset > size || length > size - offset so that a near-2^64 offset cannot wrap
+ * the sum and slip past, which the naive offset + length > size would allow. */
+static inline int oob(uint64_t offset, uint32_t length) {
+    return offset > g_vram_size || (uint64_t)length > g_vram_size - offset;
+}
+
+/* Read a full 28-byte request header WITHOUT blocking if none is queued. The
+ * first byte(s) decide: nothing queued -> 0 (adaptive batch cutoff); a header
+ * began arriving -> finish it blocking to stay frame-aligned. */
+static int recv_hdr_nb(int fd, struct nbd_req_hdr *h)
+{
+    ssize_t r = recv(fd, h, sizeof(*h), MSG_DONTWAIT);
+    if (r == 0) return -1;                                   /* peer closed */
+    if (r < 0)  return (errno == EAGAIN || errno == EWOULDBLOCK) ? 0 : -1;
+    if ((size_t)r == sizeof(*h)) return 1;
+    return (recv_all(fd, (char *)h + r, sizeof(*h) - r) == 0) ? 1 : -1;
+}
+
+/* Legacy per-request path: exact prior semantics, handles a single header that
+ * was already read. Used for oversized requests, FLUSH/TRIM, and VRAM_BATCH=0.
+ * Returns 0 to keep serving, -1 to drop the connection. */
+static int handle_one(int fd, const struct nbd_req_hdr *h, CUstream stream, char *iobuf)
+{
+    uint16_t cmd    = ntohs(h->type);
+    uint64_t handle = h->handle;
+    uint64_t offset = be64toh(h->from);
+    uint32_t length = ntohl(h->len);
+    uint32_t error  = 0;
+
+    if (g_batch_debug && (cmd == NBD_CMD_READ || cmd == NBD_CMD_WRITE))
+        __sync_fetch_and_add(&g_legacy_ops, 1);
+
+    if ((cmd == NBD_CMD_READ || cmd == NBD_CMD_WRITE) && oob(offset, length)) {
+        fprintf(stderr, "[nbd-vram] oob off=%llu len=%u\n",
+                (unsigned long long)offset, length);
+        error = EINVAL;
+    }
+
+    if (cmd == NBD_CMD_WRITE) {
+        uint32_t remaining = length;
+        uint64_t voff      = offset;
+        while (remaining > 0) {
+            uint32_t chunk = (remaining > IO_BUF_SIZE) ? IO_BUF_SIZE : remaining;
+            if (recv_all(fd, iobuf, chunk) != 0) return -1;
+            if (!error) {
+                CUresult r = _cuMemcpyHtoDAsync(g_vram_ptr + voff, iobuf, chunk, stream);
+                if (r != CUDA_SUCCESS) {
+                    fprintf(stderr, "[nbd-vram] HtoD failed: %s\n", cuda_err(r));
+                    error = EIO;
+                }
+                voff += chunk;
+            }
+            remaining -= chunk;
+        }
+        if (!error) _cuStreamSynchronize(stream);
+    } else if (cmd == NBD_CMD_FLUSH) {
+        _cuStreamSynchronize(stream);
+    }
+    /* TRIM: just ack success, VRAM doesn't need trimming */
+
+    struct nbd_resp_hdr resp;
+    resp.magic  = htonl(NBD_RESPONSE_MAGIC);
+    resp.error  = htonl(error);
+    resp.handle = handle;
+    if (send_all(fd, &resp, sizeof(resp)) != 0) return -1;
+    if (error == EIO) return -1;   /* real copy failure: hard-reset the connection */
+    if (error)        return 0;    /* bad request (EINVAL): reported, keep serving */
+
+    if (cmd == NBD_CMD_READ) {
+        uint32_t remaining = length;
+        uint64_t voff      = offset;
+        while (remaining > 0) {
+            uint32_t chunk = (remaining > IO_BUF_SIZE) ? IO_BUF_SIZE : remaining;
+            CUresult r = _cuMemcpyDtoHAsync(iobuf, g_vram_ptr + voff, chunk, stream);
+            if (r != CUDA_SUCCESS) {
+                fprintf(stderr, "[nbd-vram] DtoH failed: %s\n", cuda_err(r));
+                return -1;
+            }
+            _cuStreamSynchronize(stream);
+            if (send_all(fd, iobuf, chunk) != 0) return -1;
+            remaining -= chunk;
+            voff      += chunk;
+        }
+    }
+    return 0;
+}
+
+/* Validate a header and, if it is a batchable READ/WRITE that fits a slot,
+ * populate *op (reading the WRITE payload into the slot now, since it must be
+ * drained in frame order). Returns 1 = batched, 0 = not batchable (caller falls
+ * back to handle_one), -1 = protocol/socket error. */
+static int batch_admit(int fd, const struct nbd_req_hdr *h, struct bop *op, char *slot)
+{
+    if (ntohl(h->magic) != NBD_REQUEST_MAGIC) {
+        fprintf(stderr, "[nbd-vram] bad request magic 0x%x\n", ntohl(h->magic));
+        return -1;
+    }
+    uint16_t cmd = ntohs(h->type);
+    uint32_t len = ntohl(h->len);
+    if ((cmd != NBD_CMD_READ && cmd != NBD_CMD_WRITE) || len == 0 || len > BATCH_SLOT)
+        return 0;   /* DISC/FLUSH/TRIM or oversized: not for the batch path */
+
+    op->handle = h->handle;
+    op->offset = be64toh(h->from);
+    op->len    = len;
+    op->cmd    = cmd;
+    op->slot   = slot;
+    op->error  = oob(op->offset, len) ? EINVAL : 0;
+
+    if (cmd == NBD_CMD_WRITE) {
+        /* Drain the payload even when OOB, to stay frame-aligned; the copy is
+         * skipped in flush_batch for errored ops. */
+        if (recv_all(fd, slot, len) != 0) return -1;
+    }
+    return 1;
+}
+
+/* Issue every batched copy on the stream, then a SINGLE synchronize for the whole
+ * batch, then reply to each op. Stream FIFO order preserves intra-batch RAW/WAR.
+ * NBD matches replies by handle, so a per-op error never strands the others: a bad
+ * request (EINVAL) is reported and we keep serving; a real copy failure (EIO) is
+ * reported too, then the connection is dropped after every reply is sent. */
+static int flush_batch(int fd, struct bop *ops, int n, CUstream stream)
+{
+    int hard_err = 0;   /* an EIO occurred: reset the connection once all replies are out */
+    for (int i = 0; i < n; i++) {
+        if (ops[i].error) continue;
+        CUdeviceptr d = g_vram_ptr + ops[i].offset;
+        CUresult r = (ops[i].cmd == NBD_CMD_READ)
+            ? _cuMemcpyDtoHAsync(ops[i].slot, d, ops[i].len, stream)
+            : _cuMemcpyHtoDAsync(d, ops[i].slot, ops[i].len, stream);
+        if (r != CUDA_SUCCESS) {
+            fprintf(stderr, "[nbd-vram] batch copy failed: %s\n", cuda_err(r));
+            ops[i].error = EIO;
+            hard_err = 1;
+        }
+    }
+    _cuStreamSynchronize(stream);   /* one sync amortised across the whole batch */
+
+    if (g_batch_debug) {            /* opt-in: measure real-world batch depth */
+        __sync_fetch_and_add(&g_flush_count, 1);
+        __sync_fetch_and_add(&g_flush_ops, n);
+        if (n > 1) { __sync_fetch_and_add(&g_batch_count, 1);
+                     __sync_fetch_and_add(&g_batch_ops, n); }
+    }
+
+    for (int i = 0; i < n; i++) {
+        struct nbd_resp_hdr resp;
+        resp.magic  = htonl(NBD_RESPONSE_MAGIC);
+        resp.error  = htonl(ops[i].error);
+        resp.handle = ops[i].handle;
+        if (send_all(fd, &resp, sizeof(resp)) != 0) return -1;
+        if (ops[i].cmd == NBD_CMD_READ && !ops[i].error) {
+            if (send_all(fd, ops[i].slot, ops[i].len) != 0) return -1;
+        }
+    }
+    return hard_err ? -1 : 0;   /* EIO: every reply sent, now reset the connection */
+}
+
+static int handle_client(int fd, CUstream stream, char *batchbuf, char *iobuf)
 {
     if (nbd_handshake(fd, g_vram_size) != 0) {
         fprintf(stderr, "[nbd-vram] handshake failed\n");
@@ -406,96 +609,58 @@ static int handle_client(int fd, CUstream stream, char *iobuf)
     }
     printf("[nbd-vram] handshake OK, entering transmission mode\n");
 
-    int ret = 0;
+    struct bop ops[BATCH_DEPTH_MAX];
+    int depth = g_batch_depth;
+
     while (g_running) {
-        struct {
-            uint32_t magic;
-            uint16_t flags;
-            uint16_t type;
-            uint64_t handle;
-            uint64_t from;
-            uint32_t len;
-        } __attribute__((packed)) req;
+        /* Block here for the first request: this is the worker's idle wait. */
+        struct nbd_req_hdr h;
+        if (recv_all(fd, &h, sizeof(h)) != 0) return -1;
+        if (ntohl(h.magic) != NBD_REQUEST_MAGIC) {
+            fprintf(stderr, "[nbd-vram] bad request magic 0x%x\n", ntohl(h.magic));
+            return -1;
+        }
+        if (ntohs(h.type) == NBD_CMD_DISC) break;
 
-        if (recv_all(fd, &req, sizeof(req)) != 0) { ret = -1; break; }
-
-        if (ntohl(req.magic) != NBD_REQUEST_MAGIC) {
-            fprintf(stderr, "[nbd-vram] bad request magic 0x%x\n", ntohl(req.magic));
-            ret = -1; break;
+        if (!g_batch_enabled) {
+            if (handle_one(fd, &h, stream, iobuf) != 0) return -1;
+            continue;
         }
 
-        uint16_t cmd    = ntohs(req.type);
-        uint64_t handle = req.handle;
-        uint64_t offset = be64toh(req.from);
-        uint32_t length = ntohl(req.len);
+        int adm = batch_admit(fd, &h, &ops[0], batchbuf);
+        if (adm < 0) return -1;
+        if (adm == 0) {                       /* not batchable: legacy path */
+            if (handle_one(fd, &h, stream, iobuf) != 0) return -1;
+            continue;
+        }
 
-        if (cmd == NBD_CMD_DISC) break;
-
-        /* Bounds check (skip for FLUSH/TRIM which have length=0) */
-        uint32_t error = 0;
-        if (cmd == NBD_CMD_READ || cmd == NBD_CMD_WRITE) {
-            if (offset + length > g_vram_size) {
-                fprintf(stderr, "[nbd-vram] oob off=%llu len=%u\n",
-                        (unsigned long long)offset, length);
-                error = EINVAL;
+        /* Drain whatever else is already queued, without blocking. Idle clients
+         * yield a batch of 1 (= legacy behaviour); a busy client supplies depth.
+         * The adaptivity is free: we never wait to assemble a batch. */
+        int n = 1;
+        struct nbd_req_hdr extra;
+        int trailer = 0;   /* 0 none, 1 non-batchable header in `extra`, 2 DISC */
+        while (n < depth) {
+            int g = recv_hdr_nb(fd, &extra);
+            if (g < 0) return -1;
+            if (g == 0) break;                /* nothing more queued right now */
+            if (ntohl(extra.magic) != NBD_REQUEST_MAGIC) {
+                fprintf(stderr, "[nbd-vram] bad request magic 0x%x\n", ntohl(extra.magic));
+                return -1;
             }
+            if (ntohs(extra.type) == NBD_CMD_DISC) { trailer = 2; break; }
+            int a = batch_admit(fd, &extra, &ops[n], batchbuf + (size_t)n * BATCH_SLOT);
+            if (a < 0) return -1;
+            if (a == 0) { trailer = 1; break; }   /* flush, then handle it per-op */
+            n++;
         }
 
-        if (cmd == NBD_CMD_WRITE) {
-            /* Must drain data from socket regardless of error */
-            uint32_t remaining = length;
-            uint64_t voff      = offset;
-            while (remaining > 0) {
-                uint32_t chunk = (remaining > IO_BUF_SIZE) ? IO_BUF_SIZE : remaining;
-                if (recv_all(fd, iobuf, chunk) != 0) { ret = -1; goto done; }
-                if (!error) {
-                    CUresult r = _cuMemcpyHtoDAsync(g_vram_ptr + voff, iobuf, chunk, stream);
-                    if (r != CUDA_SUCCESS) {
-                        fprintf(stderr, "[nbd-vram] HtoD failed: %s\n", cuda_err(r));
-                        error = EIO;
-                    }
-                    voff += chunk;
-                }
-                remaining -= chunk;
-            }
-            if (!error) _cuStreamSynchronize(stream);
+        if (flush_batch(fd, ops, n, stream) != 0) return -1;
 
-        } else if (cmd == NBD_CMD_FLUSH) {
-            _cuStreamSynchronize(stream);
-        }
-        /* TRIM: just ack success, VRAM doesn't need trimming */
-
-        /* Send response */
-        struct {
-            uint32_t magic;
-            uint32_t error;
-            uint64_t handle;
-        } __attribute__((packed)) resp;
-        resp.magic  = htonl(NBD_RESPONSE_MAGIC);
-        resp.error  = htonl(error);
-        resp.handle = handle;
-        if (send_all(fd, &resp, sizeof(resp)) != 0) { ret = -1; goto done; }
-        if (error) goto done;
-
-        if (cmd == NBD_CMD_READ) {
-            uint32_t remaining = length;
-            uint64_t voff      = offset;
-            while (remaining > 0) {
-                uint32_t chunk = (remaining > IO_BUF_SIZE) ? IO_BUF_SIZE : remaining;
-                CUresult r = _cuMemcpyDtoHAsync(iobuf, g_vram_ptr + voff, chunk, stream);
-                if (r != CUDA_SUCCESS) {
-                    fprintf(stderr, "[nbd-vram] DtoH failed: %s\n", cuda_err(r));
-                    ret = -1; goto done;
-                }
-                _cuStreamSynchronize(stream);
-                if (send_all(fd, iobuf, chunk) != 0) { ret = -1; goto done; }
-                remaining -= chunk;
-                voff      += chunk;
-            }
-        }
+        if (trailer == 1) { if (handle_one(fd, &extra, stream, iobuf) != 0) return -1; }
+        else if (trailer == 2) break;
     }
-done:
-    return ret;
+    return 0;
 }
 
 /* -------------------------------------------------------------------------
@@ -507,14 +672,19 @@ static void *thread_worker(void *arg)
     int idx = (int)(intptr_t)arg;
     CUstream stream;
     void *iobuf = NULL;
+    void *batchbuf = NULL;
     /* PF_MEMALLOC_NOIO/PF_LOCAL_THROTTLE are per-task; pthread inheritance of
      * PR_SET_IO_FLUSHER is undocumented, so set it per worker too (cheap, the
      * failure case is already logged once from main). */
     prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0);
     _cuCtxSetCurrent(g_cu_ctx);
     _cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING);
-    /* Pinned host memory: eliminates CUDA driver staging copy for each DMA */
+    /* Pinned host memory: eliminates CUDA driver staging copy for each DMA.
+     * iobuf serves the per-op (oversized/FLUSH) path; batchbuf holds one slot
+     * per in-flight batched request. Both pinned, allocated once per worker. */
     _cuMemAllocHost(&iobuf, IO_BUF_SIZE);
+    if (g_batch_enabled)
+        _cuMemAllocHost(&batchbuf, (size_t)g_batch_depth * BATCH_SLOT);
 
     while (g_running) {
         /* Draining (SIGTERM arrived with a client attached): take no new
@@ -543,13 +713,14 @@ static void *thread_worker(void *arg)
         }
         g_client_fds[idx] = cfd;
         printf("[nbd-vram] client connected\n");
-        handle_client(cfd, stream, iobuf);
+        handle_client(cfd, stream, batchbuf, iobuf);
         g_client_fds[idx] = -1;
         close(cfd);
         printf("[nbd-vram] client disconnected\n");
     }
 
-    if (iobuf) _cuMemFreeHost(iobuf);
+    if (batchbuf) _cuMemFreeHost(batchbuf);
+    if (iobuf)    _cuMemFreeHost(iobuf);
     _cuStreamDestroy(stream);
     return NULL;
 }
@@ -563,16 +734,26 @@ int main(void)
     CUdevice  cu_dev;
     int       ret    = 1;
 
+    /* Socket path is fixed in production; VRAM_SOCK_PATH overrides it for
+     * non-root testing. Resolved early so every cleanup path sees it. */
+    const char *sock_path = getenv("VRAM_SOCK_PATH");
+    if (!sock_path || !*sock_path) sock_path = SOCK_PATH;
+
     signal(SIGTERM, sig_handler);
     signal(SIGINT,  sig_handler);
     signal(SIGPIPE, SIG_IGN);
 
     /* Prevent kernel from paging out our own pages - doing so would route
      * the page fault back through this daemon, deadlocking under swap pressure.
-     * Requires LimitMEMLOCK=infinity in the systemd service. */
-    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
+     * Requires LimitMEMLOCK=infinity in the systemd service. VRAM_NO_MLOCK=1
+     * skips it for unprivileged dev runs (MCL_FUTURE otherwise makes CUDA's huge
+     * VA reservation exceed a normal user's memlock limit and cuInit OOMs). */
+    if (getenv("VRAM_NO_MLOCK")) {
+        fprintf(stderr, "[nbd-vram] VRAM_NO_MLOCK set - skipping mlockall (dev/test only)\n");
+    } else if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
         fprintf(stderr, "[nbd-vram] mlockall failed (%s) - daemon pages may be swapped, risking deadlock\n",
                 strerror(errno));
+    }
 
     /* Mark the daemon as part of the I/O flush path. Sets PF_MEMALLOC_NOIO +
      * PF_LOCAL_THROTTLE so allocations made while servicing a swap write do not
@@ -620,24 +801,25 @@ int main(void)
     }
     printf("[nbd-vram] VRAM at CUDA VA 0x%llx\n", (unsigned long long)g_vram_ptr);
 
-    /* Create Unix socket */
-    unlink(SOCK_PATH);
+    /* Create Unix socket (path resolved at top of main; VRAM_SOCK_PATH may
+     * override it for non-root testing). */
+    unlink(sock_path);
     g_listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (g_listen_fd < 0) { perror("socket"); goto out_cuda; }
 
     {
         struct sockaddr_un addr = { .sun_family = AF_UNIX };
-        strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
+        strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
         if (bind(g_listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
             { perror("bind"); goto out_cuda; }
     }
-    chmod(SOCK_PATH, 0600);
+    chmod(sock_path, 0600);
     if (listen(g_listen_fd, g_nbd_threads + 1) < 0) { perror("listen"); goto out_cuda; }
     /* non-blocking so the poll()+accept() in each worker never blocks if another
      * worker grabbed the pending connection first */
     fcntl(g_listen_fd, F_SETFL, fcntl(g_listen_fd, F_GETFL, 0) | O_NONBLOCK);
 
-    printf("[nbd-vram] listening on %s (%d threads)\n", SOCK_PATH, g_nbd_threads);
+    printf("[nbd-vram] listening on %s (%d threads)\n", sock_path, g_nbd_threads);
 
     /* sd_notify READY=1 */
     {
@@ -663,6 +845,19 @@ int main(void)
             if (g_nbd_threads > NBD_THREADS_MAX) g_nbd_threads = NBD_THREADS_MAX;
         }
 
+        const char *benv = getenv("VRAM_BATCH");
+        if (benv) g_batch_enabled = atoi(benv) != 0;
+        const char *bdenv = getenv("VRAM_BATCH_DEPTH");
+        if (bdenv) {
+            g_batch_depth = atoi(bdenv);
+            if (g_batch_depth < 1) g_batch_depth = 1;
+            if (g_batch_depth > BATCH_DEPTH_MAX) g_batch_depth = BATCH_DEPTH_MAX;
+        }
+        const char *bgenv = getenv("VRAM_BATCH_DEBUG");
+        if (bgenv) g_batch_debug = atoi(bgenv) != 0;
+        printf("[nbd-vram] request batching %s (depth %d, slot %d KiB)\n",
+               g_batch_enabled ? "on" : "off", g_batch_depth, BATCH_SLOT / 1024);
+
         pthread_t threads[NBD_THREADS_MAX];
         for (int i = 0; i < g_nbd_threads; i++) g_client_fds[i] = -1;
         for (int i = 0; i < g_nbd_threads; i++)
@@ -677,11 +872,23 @@ out_cuda:
         close(g_listen_fd);
         g_listen_fd = -1;
     }
-    unlink(SOCK_PATH);
+    unlink(sock_path);
     if (g_vram_ptr) _cuMemFree(g_vram_ptr);
     if (g_cu_ctx)   _cuCtxDestroy(g_cu_ctx);
     if (g_libcuda)  dlclose(g_libcuda);
 out:
+    if (g_batch_debug) {
+        unsigned long batched_path = g_flush_ops;
+        unsigned long total = batched_path + g_legacy_ops;
+        printf("[nbd-vram] batched-path: %lu flushes, %lu ops, true avg depth %.2f\n",
+               g_flush_count, g_flush_ops,
+               g_flush_count ? (double)g_flush_ops / (double)g_flush_count : 0.0);
+        printf("[nbd-vram]   of those, %lu coalesced (n>1) carrying %lu ops (avg %.1f)\n",
+               g_batch_count, g_batch_ops,
+               g_batch_count ? (double)g_batch_ops / (double)g_batch_count : 0.0);
+        printf("[nbd-vram]   legacy/oversized ops: %lu  (%.1f%% of %lu total R/W requests)\n",
+               g_legacy_ops, total ? 100.0 * (double)g_legacy_ops / (double)total : 0.0, total);
+    }
     printf("[nbd-vram] exiting (ret=%d)\n", ret);
     return ret;
 }

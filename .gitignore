@@ -1,4 +1,5 @@
 nbd-vram
+tests/
 
 # local working files - not shipped
 .local/
