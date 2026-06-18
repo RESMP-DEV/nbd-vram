@@ -1,6 +1,4 @@
 # nbd-vram
-#### This is `alpha` software. `USE AT OWN RISK`
-> **If** you run into trouble booting at any point, simply switch to a TTY session and run the uninstall script `sudo bash uninstall.sh` from the path you originally installed NBD-VRAM from. That will get you back to a working state and allow you the opportunity to file an [issue](https://github.com/c0deJedi/nbd-vram/issues/new) for me to take a look at. Please include as much information as possible in your bug report. System specifications, display adapter configurations (single GPU, hybrid, modes etc.) and concise logs where possible.
 
 ## Use your NVIDIA GPU's VRAM as swap space on Linux.
 
@@ -52,7 +50,7 @@ The NBD approach sidesteps all of this. `cuMemcpyHtoD` and `cuMemcpyDtoH` work o
 
 - NVIDIA GPU with CUDA support (any consumer RTX/GTX card)
 - NVIDIA driver with `libcuda.so.1` (no CUDA toolkit needed)
-- Linux kernel 3.0+ (nbd module, built into most distros)
+- Linux kernel 5.6+ recommended, since that is where `PR_SET_IO_FLUSHER` landed and the swap-deadlock protection leans on it, though older kernels still run with that one safeguard disabled (the `nbd` module itself is built into most distros)
 - `nbd-client` package
 - `gcc`, `make`
 
@@ -249,6 +247,15 @@ Swap is write-heavy, and SSD NAND has a finite number of write cycles. Sending t
 ```sh
 sudo bash uninstall.sh
 ```
+
+---
+
+## Failure Recovery
+**If** you run into trouble booting at any point, simply switch to a TTY session and run the uninstall script `sudo bash uninstall.sh` from the path you originally installed NBD-VRAM from.
+
+That will get you back to a working state and allow you the opportunity to file an [issue](https://github.com/c0deJedi/nbd-vram/issues/new) for me to take a look at.
+
+Please include as much information as possible in your bug report eg: system specifications, display adapter configurations (single GPU, hybrid, modes etc.) and concise logs where possible.
 
 ---
 
