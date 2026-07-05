@@ -155,6 +155,51 @@ static void p100vram_p2p_free_cb(void *data)
 #endif /* CONFIG_NVIDIA_P2P */
 
 /* -------------------------------------------------------------------------
+ * Block device operations
+ *
+ * add_disk() dereferences gd->fops during registration, so even a
+ * skeleton disk needs a real struct block_device_operations. The open
+ * hook refuses new opens once the backing VRAM is gone.
+ * ---------------------------------------------------------------------- */
+
+static int p100vram_blk_open(struct gendisk *gd, blk_mode_t mode)
+{
+    struct p100vram_disk *disk = gd->private_data;
+    unsigned long flags;
+    int ret = 0;
+
+    spin_lock_irqsave(&disk->lock, flags);
+    if (disk->state != P100VRAM_DISK_LIVE)
+        ret = -ENODEV;          /* dead or dying - refuse new opens */
+    spin_unlock_irqrestore(&disk->lock, flags);
+    return ret;
+}
+
+static void p100vram_blk_release(struct gendisk *gd)
+{
+    /* Nothing to free per-open today; state transitions are owned by
+     * the P2P invalidation callback + control ioctl. */
+    (void)gd;
+}
+
+static int p100vram_blk_getgeo(struct block_device *bdev, struct hd_geometry *geo)
+{
+    /* Swap doesn't need geometry, but some userland probes ask. */
+    geo->heads = 16;
+    geo->sectors = 63;
+    geo->cylinders = get_capacity(bdev->bd_disk) / (16 * 63);
+    geo->start = 0;
+    return 0;
+}
+
+static const struct block_device_operations p100vram_bdops = {
+    .owner   = THIS_MODULE,
+    .open    = p100vram_blk_open,
+    .release = p100vram_blk_release,
+    .getgeo  = p100vram_blk_getgeo,
+};
+
+/* -------------------------------------------------------------------------
  * Disk create / destroy
  * ---------------------------------------------------------------------- */
 
@@ -217,12 +262,17 @@ static int p100vram_create_disk(const struct p100vram_create_disk *req)
         goto err_free_tag_set;
     }
 
-    disk->gd->major       = 0;            /* dynamic major per disk   */
+    /* Dynamic major/devt: leave major=0 and minors=0 so the block layer
+     * uses the extended dynamic-devt path. Setting minors>=1 with
+     * major=0 makes add_disk() fail with -EINVAL. */
+    disk->gd->major       = 0;
     disk->gd->first_minor = 0;
-    disk->gd->minors      = 1;
-    disk->gd->fops        = NULL;         /* TODO(stage 7): block fops */
+    disk->gd->minors      = 0;
+    disk->gd->fops        = &p100vram_bdops;
     disk->gd->private_data= disk;
-    strscpy(disk->gd->disk_name, disk->name, DISK_NAME_LEN);
+    /* Allocator docs say /dev/p100vram<name>; prefix here so udev node
+     * matches the documented contract. */
+    snprintf(disk->gd->disk_name, DISK_NAME_LEN, DRV_NAME "%s", disk->name);
     set_capacity(disk->gd, disk->size >> SECTOR_SHIFT);
     blk_queue_flag_set(QUEUE_FLAG_NONROT, disk->gd->queue);
     blk_queue_flag_clear(QUEUE_FLAG_ADD_RANDOM, disk->gd->queue);
@@ -240,10 +290,21 @@ static int p100vram_create_disk(const struct p100vram_create_disk *req)
     if (ret < 0)
         goto err_put_disk;
 
-    add_disk(disk->gd);
-    pr_info(DRV_NAME ": created /dev/%s size=%llu gpu=%u\n",
-            disk->name, (unsigned long long)disk->size, disk->gpu_index);
+    ret = add_disk(disk->gd);
+    if (ret) {
+        pr_err(DRV_NAME ": add_disk failed: %d\n", ret);
+        goto err_remove_idr;
+    }
+    pr_info(DRV_NAME ": created /dev/%s%s size=%llu gpu=%u\n",
+            DRV_NAME, disk->name,
+            (unsigned long long)disk->size, disk->gpu_index);
     return 0;
+
+err_remove_idr:
+    mutex_lock(&g_lock);
+    idr_remove(&g_disk_idr, disk->idr_id);
+    list_del(&disk->list);
+    mutex_unlock(&g_lock);
 
 err_put_disk:
     put_disk(disk->gd);

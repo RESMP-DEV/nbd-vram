@@ -156,9 +156,21 @@ static int allocate_and_register(int gpu, long size_mb, const char *name) {
     }
     fprintf(stderr, "[p100vram-alloc] /dev/p100vram%s ready (size=%zu)\n", name, size);
 
-    /* Hold the allocation live until asked to stop. NVIDIA's free
-     * callback will fire in the kmod and fail I/O cleanly. */
-    while (!g_stop) pause();
+    /* Hold the allocation live until asked to stop. Race-free wait:
+     * block SIGTERM/SIGINT around the check + sigsuspend so a signal
+     * delivered between testing g_stop and sleeping is not lost (which
+     * plain pause() would miss, leaving the daemon stuck until SIGKILL).
+     * NVIDIA's free callback fires in the kmod and fails I/O cleanly. */
+    {
+        sigset_t mask, oldmask;
+        sigemptyset(&mask);
+        sigaddset(&mask, SIGTERM);
+        sigaddset(&mask, SIGINT);
+        sigprocmask(SIG_BLOCK, &mask, &oldmask);
+        while (!g_stop)
+            sigsuspend(&oldmask);
+        sigprocmask(SIG_SETMASK, &oldmask, NULL);
+    }
 
     ret = 0;
 out_close:
