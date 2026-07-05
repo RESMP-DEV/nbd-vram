@@ -1,0 +1,18 @@
+# Kbuild for the p100vram block device (Stage 7 skeleton)
+#
+# Out-of-tree build on the P100 host:
+#   make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
+#
+# To enable the real NVIDIA P2P path, build with:
+#   make ... KCFLAGS+=-DCONFIG_NVIDIA_P2P
+# and have the NVIDIA driver kernel headers on the include path.
+
+obj-m += p100vram.o
+
+p100vram-y := p100vram.o
+
+ccflags-y += -I$(src)/../../include
+ccflags-y += -DCONFIG_NVIDIA_P2P_STUB
+# ccflags-y += -DCONFIG_NVIDIA_P2P   # uncomment on a host with nvidia_p2p.h
+
+clean-files := *.o *.ko *.mod *.mod.c .*.cmd modules.order Module.symvers
