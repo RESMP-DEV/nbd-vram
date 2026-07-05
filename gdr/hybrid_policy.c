@@ -31,13 +31,14 @@ enum p100vram_io_policy p100vram_select_policy(
     if (!t) t = &k_defaults;
 
     if (dir == P100VRAM_IO_READ) {
-        if (t->gdr_read_enabled && size <= t->gdr_read_threshold_bytes)
+        /* "below this may try GDR" -> strictly less than */
+        if (t->gdr_read_enabled && size < t->gdr_read_threshold_bytes)
             return P100VRAM_POLICY_ALL_GDR;
         return P100VRAM_POLICY_ALL_CUDA;
     }
 
-    /* WRITE */
-    if (size <= t->gdr_write_threshold_bytes)
+    /* WRITE: ">= this size -> CUDA write" -> below the threshold uses GDR */
+    if (size < t->gdr_write_threshold_bytes)
         return P100VRAM_POLICY_HYBRID;   /* GDR write, CUDA read path */
     return P100VRAM_POLICY_ALL_CUDA;
 }
