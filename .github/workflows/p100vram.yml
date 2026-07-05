@@ -1,9 +1,16 @@
-# ci/build.yml - GitHub Actions for the p100vram-shelf project.
+# .github/workflows/p100vram.yml - CI for the p100vram-shelf project.
+#
+# Linux-only. Ubuntu runners are free + unlimited for public repos; we
+# dropped the previous macos-latest job because macOS runners are billed
+# even on public repos and locked the org out of Actions entirely once
+# the $0 spending limit was hit. The unit tests are POSIX C and run
+# identically on Linux, so this loses no coverage.
 #
 # Two jobs:
-#   build-mac   - always green signal: unit tests against stubs.
-#   build-linux - kernel module + CUDA sidecar; continue-on-error until
-#                 CUDA toolkit / NVIDIA driver headers land on the runner.
+#   unit-tests - the required green gate: build stubs + run make test.
+#   build      - allocator + gdr + sidecar + kmod; the kmod step is
+#                non-blocking because it cannot link without NVIDIA P2P
+#                kernel headers, which the hosted runner does not have.
 name: build
 on:
   push:
@@ -11,27 +18,23 @@ on:
   pull_request:
 
 # Least-privilege: this workflow only reads the repo and runs builds.
-# No releases, no deployments, no PR comment writes needed.
 permissions:
   contents: read
 
 jobs:
-  build-mac:
-    runs-on: macos-latest
+  unit-tests:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Build all (stub CUDA)
+      - name: Build (stub CUDA)
         run: make all
       - name: Unit tests
         run: make test
 
-  build-linux:
+  build:
     runs-on: ubuntu-latest
-    continue-on-error: true
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,7 +45,13 @@ jobs:
           sudo apt-get install -y build-essential linux-headers-$(uname -r)
       - name: Build allocator + gdr + sidecar
         run: make alloc gdr sidecar-cuda sidecar
-      - name: Build kernel module (no NVIDIA headers on runner)
-        run: make kmod || echo "kmod needs NVIDIA P2P headers; expected on CI"
+      - name: Build kernel module
+        # The hosted runner has no NVIDIA driver / nvidia_p2p.h, so the
+        # kmod builds in stub mode. A real build happens on the P100 host
+        # via scripts/deploy.sh. Keep this non-blocking: a failure here
+        # means the skeleton regressed against Linux headers, not that
+        # the project broke.
+        continue-on-error: true
+        run: make kmod
       - name: Unit tests
         run: make test
