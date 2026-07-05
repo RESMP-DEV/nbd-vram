@@ -3,3 +3,16 @@ tests/
 
 # local working files - not shipped
 .local/
+
+# p100vram-shelf build artifacts
+*.o
+*.a
+*.ko
+*.mod
+*.mod.c
+p100vram-alloc
+p100vram-sidecar
+unit_tests
+.*.cmd
+modules.order
+Module.symvers
