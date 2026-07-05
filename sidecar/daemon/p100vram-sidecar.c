@@ -68,6 +68,10 @@ static int write_n(int fd, const void *buf, size_t n) {
     return 0;
 }
 
+/* Forward decl: handle_client dispatches via send_reply, defined below. */
+static int send_reply(int cfd, uint16_t op, uint64_t req_id,
+                      const void *body, uint64_t body_bytes);
+
 static int handle_client(int cfd) {
     uint8_t hbuf[24];
     struct p100vram_rpc_hdr h;
@@ -75,44 +79,84 @@ static int handle_client(int cfd) {
     if (p100vram_rpc_decode_hdr(&h, hbuf, sizeof(hbuf)) < 0) return -1;
     if (p100vram_rpc_validate_hdr(&h) != 0) return -1;
 
-    /* Stubbed dispatch: each op calls the matching kernel wrapper,
-     * which (in skeleton form) returns 0 + zeroed output. The real
-     * Stage 9 path reads the op-specific body, allocates scratch,
-     * launches the kernel, and writes the result back. */
-    int rc = 0;
-    switch (h.op) {
+    /* Dispatch every advertised opcode to its kernel wrapper so the
+     * wiring is real even in stub form (each wrapper returns 0 + zeroed
+     * output today). The real Stage 9 path will read op-specific bodies,
+     * allocate scratch, launch the kernel, and write real results.
+     *
+     * Each case below reads its op-specific request body before replying,
+     * so a client using COMPRESS/SCAN/DEDUP/PREFETCH gets a dispatched
+     * response rather than falling through to a generic empty reply. */
+    uint16_t op = h.op;
+    uint64_t req_id = h.req_id;
+
+    switch (op) {
     case P100VRAM_OP_HASH_PAGES: {
         struct p100vram_rpc_hash_pages_req req;
         if (read_n(cfd, &req, sizeof(req)) != 0) return -1;
         uint64_t digest = 0;
-        rc = p100vram_kern_hash_pages(req.gpu_va + req.offset, req.length,
-                                      req.algo, &digest);
-        struct p100vram_rpc_hdr rh = {
-            .magic = P100VRAM_RPC_MAGIC, .version = P100VRAM_RPC_VERSION,
-            .op = h.op, .req_id = h.req_id,
-            .body_bytes = sizeof(struct p100vram_rpc_hash_pages_rep),
-        };
+        p100vram_kern_hash_pages(req.gpu_va + req.offset, req.length,
+                                 req.algo, &digest);
         struct p100vram_rpc_hash_pages_rep rep = { .digest = digest };
-        uint8_t out[24];
-        p100vram_rpc_encode_hdr(&rh, out, sizeof(out));
-        write_n(cfd, out, sizeof(out));
-        write_n(cfd, &rep, sizeof(rep));
+        send_reply(cfd, op, req_id, &rep, sizeof(rep));
+        break;
+    }
+    case P100VRAM_OP_COMPRESS_PAGES: {
+        struct p100vram_rpc_hash_pages_req req;  /* same layout: region + length */
+        if (read_n(cfd, &req, sizeof(req)) != 0) return -1;
+        uint64_t out_bytes = 0;
+        /* Stub: out_va 0, out_cap 0 -> wrapper returns 0 bytes. */
+        p100vram_kern_compress_pages(req.gpu_va + req.offset, req.length,
+                                     0, 0, &out_bytes);
+        struct { uint64_t out_bytes; } rep = { out_bytes };
+        send_reply(cfd, op, req_id, &rep, sizeof(rep));
+        break;
+    }
+    case P100VRAM_OP_SCAN_VECTORS: {
+        struct p100vram_rpc_hash_pages_req req;  /* region header */
+        if (read_n(cfd, &req, sizeof(req)) != 0) return -1;
+        float best = 0.f;
+        uint64_t idx = 0;
+        p100vram_kern_scan_vectors(req.gpu_va + req.offset, 0, 0, 0,
+                                   &best, &idx);
+        struct { float best; uint64_t idx; } rep = { best, idx };
+        send_reply(cfd, op, req_id, &rep, sizeof(rep));
+        break;
+    }
+    case P100VRAM_OP_DEDUP_REGION: {
+        struct p100vram_rpc_hash_pages_req req;
+        if (read_n(cfd, &req, sizeof(req)) != 0) return -1;
+        p100vram_kern_dedup_region(req.gpu_va + req.offset, req.length, 0, 0);
+        send_reply(cfd, op, req_id, NULL, 0);
+        break;
+    }
+    case P100VRAM_OP_PREFETCH: {
+        struct p100vram_rpc_hash_pages_req req;
+        if (read_n(cfd, &req, sizeof(req)) != 0) return -1;
+        p100vram_kern_prefetch_region(0, req.gpu_va + req.offset, req.length);
+        send_reply(cfd, op, req_id, NULL, 0);
         break;
     }
     default:
-        /* Other ops: stub reply with empty body so the client sees a
-         * well-formed response and the plumbing is exercisable. */
-        rc = 0;
-        struct p100vram_rpc_hdr rh = {
-            .magic = P100VRAM_RPC_MAGIC, .version = P100VRAM_RPC_VERSION,
-            .op = h.op, .req_id = h.req_id, .body_bytes = 0,
-        };
-        uint8_t out[24];
-        p100vram_rpc_encode_hdr(&rh, out, sizeof(out));
-        write_n(cfd, out, sizeof(out));
-        break;
+        /* validate_hdr already rejected unknown opcodes, so this is
+         * unreachable; keep it defensive. */
+        return -1;
     }
-    (void)rc;
+    return 0;
+}
+
+/* Encode the reply header + optional body and write them. body may be
+ * NULL when body_bytes is 0. */
+static int send_reply(int cfd, uint16_t op, uint64_t req_id,
+                      const void *body, uint64_t body_bytes) {
+    struct p100vram_rpc_hdr rh = {
+        .magic = P100VRAM_RPC_MAGIC, .version = P100VRAM_RPC_VERSION,
+        .op = op, .req_id = req_id, .body_bytes = body_bytes,
+    };
+    uint8_t out[24];
+    p100vram_rpc_encode_hdr(&rh, out, sizeof(out));
+    if (write_n(cfd, out, sizeof(out)) != 0) return -1;
+    if (body_bytes && body && write_n(cfd, body, body_bytes) != 0) return -1;
     return 0;
 }
 
