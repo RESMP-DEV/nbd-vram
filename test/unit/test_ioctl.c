@@ -2,8 +2,9 @@
 #include <string.h>
 
 #include "p100vram_ioctl.h"
+#include "main.h"
 
-int test_create_disk_layout(void) {
+static int test_create_disk_layout(void) {
     if (sizeof(struct p100vram_create_disk) != P100VRAM_CREATE_DISK_EXPECTED_SIZE)
         return 1;
     /* name[] should occupy the final 32 bytes (offset 24..55) */
@@ -14,8 +15,6 @@ int test_create_disk_layout(void) {
     if (d.name[sizeof(d.name) - 1] != '\0') return 3;
     return 0;
 }
-
-#include "main.h"
 
 const struct test_entry test_ioctl_entries[] = {
     { "create_disk_layout", test_create_disk_layout },

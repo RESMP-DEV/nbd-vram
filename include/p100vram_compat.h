@@ -53,8 +53,11 @@ typedef void (*p100vram_p2p_free_callback)(void *data);
  * ---------------------------------------------------------------------- */
 
 #ifndef HAVE_GDRCOPY
+/* libgdrapi declares `typedef struct gdr *gdr_t;` (an opaque pointer).
+ * Mirror that here so Stage 8 code using `gdr_t g = gdr_open(); gdr_close(g);`
+ * compiles unchanged across stub and real GDRCopy builds. */
 struct gdr;
-typedef struct gdr gdr_t;
+typedef struct gdr *gdr_t;
 typedef struct gdr_mh_s { unsigned int h; } gdr_mh_t;
 #endif
 

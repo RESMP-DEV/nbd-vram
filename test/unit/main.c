@@ -10,8 +10,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-typedef int (*test_fn)(void);
-struct test_entry { const char *name; test_fn fn; };
+#include "main.h"
 
 /* Each test module provides an array of these, terminated by {NULL,NULL}
  * and named per the convention below. main() pulls them in via weak

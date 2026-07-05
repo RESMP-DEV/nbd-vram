@@ -10,11 +10,18 @@ on:
     branches: [main, master]
   pull_request:
 
+# Least-privilege: this workflow only reads the repo and runs builds.
+# No releases, no deployments, no PR comment writes needed.
+permissions:
+  contents: read
+
 jobs:
   build-mac:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Build all (stub CUDA)
         run: make all
       - name: Unit tests
@@ -23,8 +30,12 @@ jobs:
   build-linux:
     runs-on: ubuntu-latest
     continue-on-error: true
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install build deps
         run: |
           sudo apt-get update

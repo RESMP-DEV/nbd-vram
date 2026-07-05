@@ -42,10 +42,17 @@ alloc:
 	$(call subdir,kernel/allocator)
 
 # --- Stage 7: kernel module (Linux only) ---
+# Only swallow the "absent dir / wrong OS" case; a real build failure
+# from an existing kernel/module dir must propagate, otherwise make kmod
+# can report success without producing p100vram.ko.
 kmod:
-	@echo "[kmod] Linux-only target"
-	$(MAKE) -C kernel/module modules || \
-		echo "[kmod] skipped (expected on $(UNAME_S))"
+	@if [ ! -d kernel/module ] || [ ! -f kernel/module/Makefile ]; then \
+		echo "[kmod] kernel/module absent - skipped"; \
+	elif [ "$(UNAME_S)" != "Linux" ]; then \
+		echo "[kmod] requires Linux kernel headers - skipped on $(UNAME_S)"; \
+	else \
+		$(MAKE) -C kernel/module modules; \
+	fi
 
 # --- Stage 8: GDRCopy write-path library ---
 gdr:
@@ -87,10 +94,11 @@ distclean: clean
 
 help:
 	@echo "Targets:"
-	@echo "  all              - baseline + gdr + alloc + sidecar (builds on Mac)"
-	@echo "  baseline         - the unmodified nbd-vram daemon"
-	@echo "  alloc            - Stage 7 userspace allocator (p100vram-alloc)"
-	@echo "  kmod             - Stage 7 kernel module (Linux + kernel headers only)"
+	@echo "  all              - gdr + sidecar-cuda + sidecar (Mac);"
+	@echo "                     + baseline + alloc on Linux"
+	@echo "  baseline         - the unmodified nbd-vram daemon (Linux only)"
+	@echo "  alloc            - Stage 7 userspace allocator (p100vram-alloc, Linux)"
+	@echo "  kmod             - Stage 7 kernel module (Linux + kernel headers)"
 	@echo "  gdr              - Stage 8 GDRCopy write-path library"
 	@echo "  sidecar-cuda     - Stage 9 CUDA kernels (real or stub)"
 	@echo "  sidecar          - Stage 9 per-GPU RPC daemon"

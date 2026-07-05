@@ -23,7 +23,7 @@ workloads, with DDR as hot tier and CUDA as near-data compute.
 | `include/` | — | shared UAPI: ioctl, RPC protocol, compat shims |
 | `test/unit/` | — | unit tests (run on macOS — the green CI signal) |
 | `test/integration/` | — | host-only swap/pressure tests (Linux + P100) |
-| `docs/DESIGN.md`, `docs/VALIDATION.md` | — | architecture + Mac-vs-host matrix |
+| `docs/VALIDATION.md` | — | Mac-vs-host build/test matrix |
 | `scripts/deploy.sh` | — | rsync + remote build to the P100 host |
 | `.github/workflows/p100vram.yml` | — | CI (Mac green; Linux continue-on-error) |
 
@@ -37,7 +37,7 @@ make help      # all targets
 
 Kernel module and real CUDA kernels build only on the Linux + P100 host
 (`make kmod`, real `kernels.o`). See `docs/VALIDATION.md` for the full
-Mac-vs-host matrix and `docs/DESIGN.md` for the stage gates.
+Mac-vs-host matrix.
 
 ---
 

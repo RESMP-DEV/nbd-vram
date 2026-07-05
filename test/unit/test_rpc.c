@@ -11,7 +11,7 @@
 #include "p100vram_rpc.h"
 #include "main.h"   /* struct test_entry */
 
-int test_rpc_hdr_roundtrip(void) {
+static int test_rpc_hdr_roundtrip(void) {
     struct p100vram_rpc_hdr in = {
         .magic = P100VRAM_RPC_MAGIC,
         .version = P100VRAM_RPC_VERSION,
@@ -29,7 +29,7 @@ int test_rpc_hdr_roundtrip(void) {
     return 0;
 }
 
-int test_rpc_hdr_rejects_bad_magic(void) {
+static int test_rpc_hdr_rejects_bad_magic(void) {
     struct p100vram_rpc_hdr h = {
         .magic = 0xffffffff, .version = P100VRAM_RPC_VERSION,
         .op = P100VRAM_OP_HASH_PAGES, .req_id = 0, .body_bytes = 0,
@@ -37,7 +37,7 @@ int test_rpc_hdr_rejects_bad_magic(void) {
     return p100vram_rpc_validate_hdr(&h) == 0 ? 1 : 0;
 }
 
-int test_rpc_hdr_rejects_bad_op(void) {
+static int test_rpc_hdr_rejects_bad_op(void) {
     struct p100vram_rpc_hdr h = {
         .magic = P100VRAM_RPC_MAGIC, .version = P100VRAM_RPC_VERSION,
         .op = 9999, .req_id = 0, .body_bytes = 0,
@@ -45,7 +45,7 @@ int test_rpc_hdr_rejects_bad_op(void) {
     return p100vram_rpc_validate_hdr(&h) == 0 ? 1 : 0;
 }
 
-int test_rpc_encode_too_small(void) {
+static int test_rpc_encode_too_small(void) {
     struct p100vram_rpc_hdr h = { .magic = P100VRAM_RPC_MAGIC };
     uint8_t buf[8];
     return p100vram_rpc_encode_hdr(&h, buf, sizeof(buf)) >= 0 ? 1 : 0;
