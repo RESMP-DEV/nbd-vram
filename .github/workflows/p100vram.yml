@@ -1,0 +1,37 @@
+# ci/build.yml - GitHub Actions for the p100vram-shelf project.
+#
+# Two jobs:
+#   build-mac   - always green signal: unit tests against stubs.
+#   build-linux - kernel module + CUDA sidecar; continue-on-error until
+#                 CUDA toolkit / NVIDIA driver headers land on the runner.
+name: build
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build all (stub CUDA)
+        run: make all
+      - name: Unit tests
+        run: make test
+
+  build-linux:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential linux-headers-$(uname -r)
+      - name: Build allocator + gdr + sidecar
+        run: make alloc gdr sidecar-cuda sidecar
+      - name: Build kernel module (no NVIDIA headers on runner)
+        run: make kmod || echo "kmod needs NVIDIA P2P headers; expected on CI"
+      - name: Unit tests
+        run: make test

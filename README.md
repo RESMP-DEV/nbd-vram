@@ -1,4 +1,47 @@
-# nbd-vram
+# nbd-vram — P100 HBM2 memory shelf fork
+
+This fork keeps the upstream **nbd-vram** daemon (below) as the
+**Stage 2 baseline** and adds in-tree work for the three pure-software
+stages of the *Programmable HBM2 Memory Shelf for Agent Servers* plan:
+using Tesla P100/V100-class cards as ECC HBM2 spill tiers for AI-agent
+workloads, with DDR as hot tier and CUDA as near-data compute.
+
+> Project thesis: deprecated datacenter GPUs can act as power-managed,
+> programmable HBM2 spill tiers for AI-agent workloads. Not "GPU memory
+> replaces RAM."
+
+## Layout
+
+| Path | Stage | What |
+|---|---|---|
+| `nbd-vram.c`, `Makefile` (baseline rule), `systemd/`, `udev/`, `benchmarks/` | 2 | upstream baseline, **unchanged** |
+| `kernel/module/` | 7 | blk-mq kmod + NVIDIA P2P (`nvidia_p2p_get_pages`) + invalidation cb |
+| `kernel/allocator/` | 7 | userspace CUDA allocator daemon (`p100vram-alloc`) |
+| `gdr/` | 8 | GDRCopy write-path library + hybrid read/write policy |
+| `sidecar/cuda/` | 9 | per-GPU CUDA kernels (`sm_60`) |
+| `sidecar/daemon/` | 9 | per-GPU RPC sidecar (`p100vram-sidecar`) |
+| `include/` | — | shared UAPI: ioctl, RPC protocol, compat shims |
+| `test/unit/` | — | unit tests (run on macOS — the green CI signal) |
+| `test/integration/` | — | host-only swap/pressure tests (Linux + P100) |
+| `docs/DESIGN.md`, `docs/VALIDATION.md` | — | architecture + Mac-vs-host matrix |
+| `scripts/deploy.sh` | — | rsync + remote build to the P100 host |
+| `.github/workflows/p100vram.yml` | — | CI (Mac green; Linux continue-on-error) |
+
+## Quick start
+
+```sh
+make all       # builds gdr lib + sidecar (stub kernels) on Mac
+make test      # unit tests
+make help      # all targets
+```
+
+Kernel module and real CUDA kernels build only on the Linux + P100 host
+(`make kmod`, real `kernels.o`). See `docs/VALIDATION.md` for the full
+Mac-vs-host matrix and `docs/DESIGN.md` for the stage gates.
+
+---
+
+# nbd-vram (upstream baseline)
 
 ## Use your NVIDIA GPU's VRAM as swap space on Linux.
 
