@@ -1,29 +1,39 @@
 # .github/workflows/p100vram.yml - CI for the p100vram-shelf project.
 #
-# Linux-only. Ubuntu runners are free + unlimited for public repos; we
-# dropped the previous macos-latest job because macOS runners are billed
-# even on public repos and locked the org out of Actions entirely once
-# the $0 spending limit was hit. The unit tests are POSIX C and run
-# identically on Linux, so this loses no coverage.
+# Two execution paths:
+#   - Self-hosted macOS runner (kearm-m4-nbdvram) for same-repo PRs and
+#     pushes. Bypasses GitHub billed minutes entirely, so it works even
+#     with the org's $0 Actions spending limit. SECURITY: only fires for
+#     pushes and PRs whose head branch is in RESMP-DEV/nbd-vram itself;
+#     fork PRs skip this job so a stranger's PR cannot run code on the
+#     runner host.
+#   - Hosted Ubuntu runner as a fallback for fork PRs (and as a Linux
+#     build signal). Ubuntu minutes are free + unlimited for public
+#     repos, but this still needs the org's past-due balance settled
+#     before it can actually start; until then fork PRs have no CI.
 #
-# Two jobs:
-#   unit-tests - the required green gate: build stubs + run make test.
-#   build      - allocator + gdr + sidecar + kmod; the kmod step is
-#                non-blocking because it cannot link without NVIDIA P2P
-#                kernel headers, which the hosted runner does not have.
+# Both paths run the same build + test, so coverage is identical.
 name: build
 on:
   push:
     branches: [main, master]
   pull_request:
 
-# Least-privilege: this workflow only reads the repo and runs builds.
 permissions:
   contents: read
 
+# Self-hosted runs only for trusted events. Keep this expression in
+# sync with the if: on the self-hosted job below.
 jobs:
-  unit-tests:
-    runs-on: ubuntu-latest
+  # Trusted-path CI on the self-hosted Mac runner. No billed minutes.
+  unit-tests-self-hosted:
+    # Only run for pushes, and for PRs whose head repo is THIS repo
+    # (not a fork). Fork PRs fall through to the hosted job below.
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: [self-hosted, mac-arm64-nbdvram]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,8 +43,37 @@ jobs:
       - name: Unit tests
         run: make test
 
-  build:
+  # Fallback: hosted Ubuntu runner. Free for public repos once the org's
+  # Actions billing lock is cleared. Used for fork PRs and as a Linux
+  # build signal. Stays non-required so it doesn't block merges while
+  # the billing lock is still in place.
+  unit-tests-hosted:
+    # Run on pushes always; for PRs, only run on forks (same-repo PRs
+    # are covered by the self-hosted job above).
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build (stub CUDA)
+        run: make all
+      - name: Unit tests
+        run: make test
+
+  # Optional Linux build signal: allocator + gdr + sidecar + kmod. The
+  # kmod step is non-blocking (no NVIDIA headers on the hosted runner).
+  build-linux:
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name != github.repository)
+    runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -46,12 +85,5 @@ jobs:
       - name: Build allocator + gdr + sidecar
         run: make alloc gdr sidecar-cuda sidecar
       - name: Build kernel module
-        # The hosted runner has no NVIDIA driver / nvidia_p2p.h, so the
-        # kmod builds in stub mode. A real build happens on the P100 host
-        # via scripts/deploy.sh. Keep this non-blocking: a failure here
-        # means the skeleton regressed against Linux headers, not that
-        # the project broke.
         continue-on-error: true
         run: make kmod
-      - name: Unit tests
-        run: make test
